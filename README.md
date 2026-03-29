@@ -5,9 +5,9 @@
 ```
 Trained model (.safetensors, .onnx, numpy)
         |
-  [ sandcastles ]        <-- this tool
+  [ sandcastles ]        
         |
-  Synthesizable Verilog (hardwired weights)
+  Synthesizable Verilog (the hardwired weights)
         |
    OpenLane / LibreLane  
         |
