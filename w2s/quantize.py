@@ -1,0 +1,932 @@
+"""
+quantize.py -- Quantization engine for weights2silicon.
+
+Takes a ComputeGraph with float weights and calibration data, quantizes
+all weights, computes requantization parameters, and populates
+op.q_weights and op.q_params on every Operation that carries weights.
+
+Activation ranges are determined by running a float forward pass over
+the calibration data so that requantization multipliers map the
+accumulator scale back to the correct output-tensor scale.
+"""
+
+import math
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+
+from w2s.core import (
+    ComputeGraph,
+    OpType,
+    Operation,
+    QuantConfig,
+    QuantGranularity,
+    QuantScheme,
+)
+from w2s.emit import acc_bits_for
+
+
+# ---------------------------------------------------------------------------
+#  Public entry point
+# ---------------------------------------------------------------------------
+
+def quantize_graph(
+    graph: ComputeGraph,
+    calibration_data: Dict[str, np.ndarray],
+    config: QuantConfig = None,
+) -> ComputeGraph:
+    """
+    Quantize all operations in the graph.
+
+    1. Run a float forward pass with calibration_data to determine
+       activation ranges.
+    2. For each op, quantize weights and compute requantization
+       parameters.
+    3. Populate op.q_weights and op.q_params.
+
+    Returns the same graph (mutated in place).
+    """
+    if config is None:
+        config = graph.quant_config
+
+    bits = config.bits
+    scheme = config.scheme
+    granularity = config.granularity
+
+    # Step 1 -- calibrate: run float forward pass, collect tensor ranges
+    tensor_ranges = calibrate(graph, calibration_data)
+    graph.tensor_ranges = tensor_ranges
+
+    # Compute a scale for every tensor from its observed range
+    tensor_scales: Dict[str, float] = {}
+    for tname, (lo, hi) in tensor_ranges.items():
+        tensor_scales[tname] = _scale_from_range(lo, hi, bits, scheme)
+    graph.tensor_scales = tensor_scales
+
+    # Step 2 -- quantize in topological order
+    ordered_ops = graph.topological_order()
+
+    for op in ordered_ops:
+        _quantize_op(op, tensor_scales, bits, scheme, granularity)
+
+    return graph
+
+
+# ---------------------------------------------------------------------------
+#  Calibration -- float forward pass
+# ---------------------------------------------------------------------------
+
+def calibrate(
+    graph: ComputeGraph,
+    calibration_data: Dict[str, np.ndarray],
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Run a float forward pass over *calibration_data* to determine the
+    min/max range of every intermediate tensor.
+
+    Returns {tensor_name: (min_val, max_val)}.
+    """
+    tensor_values: Dict[str, np.ndarray] = {}
+
+    # Seed with calibration inputs
+    for name, data in calibration_data.items():
+        tensor_values[name] = data.astype(np.float64)
+
+    ordered_ops = graph.topological_order()
+
+    for op in ordered_ops:
+        outputs = forward_op_float(op, tensor_values)
+        tensor_values.update(outputs)
+
+    # Collect ranges
+    ranges: Dict[str, Tuple[float, float]] = {}
+    for name, val in tensor_values.items():
+        lo = float(np.min(val))
+        hi = float(np.max(val))
+        # Guard against perfectly-zero tensors -- give them a small range
+        # so scale is not infinite.
+        if lo == hi:
+            lo = lo - 1e-6
+            hi = hi + 1e-6
+        ranges[name] = (lo, hi)
+
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+#  Float forward pass for a single operation
+# ---------------------------------------------------------------------------
+
+def forward_op_float(
+    op: Operation,
+    tensor_values: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """
+    Execute one operation in float precision.
+
+    Reads its inputs from *tensor_values* and returns a dict mapping
+    each output tensor name to its computed value.
+    """
+    otype = op.op_type
+    out_name = op.outputs[0]
+
+    # ---- linear / dense ---------------------------------------------------
+    if otype == OpType.DENSE:
+        x = tensor_values[op.inputs[0]]
+        w = op.weights['weight']                  # (n_out, n_in)
+        b = op.weights.get('bias')                # (n_out,) or None
+        y = x @ w.T
+        if b is not None:
+            y = y + b
+        act = op.attrs.get('activation', 'none')
+        if act == 'relu':
+            y = np.maximum(y, 0.0)
+        return {out_name: y}
+
+    # ---- convolutions -----------------------------------------------------
+    if otype == OpType.CONV2D:
+        return {out_name: _conv2d_float(op, tensor_values)}
+
+    if otype == OpType.CONV1D:
+        return {out_name: _conv1d_float(op, tensor_values)}
+
+    # ---- element-wise activations -----------------------------------------
+    if otype == OpType.RELU:
+        x = tensor_values[op.inputs[0]]
+        return {out_name: np.maximum(x, 0.0)}
+
+    if otype == OpType.GELU:
+        x = tensor_values[op.inputs[0]]
+        # tanh approximation (matches PyTorch default)
+        c = math.sqrt(2.0 / math.pi)
+        y = 0.5 * x * (1.0 + np.tanh(c * (x + 0.044715 * x ** 3)))
+        return {out_name: y}
+
+    if otype == OpType.SIGMOID:
+        x = tensor_values[op.inputs[0]]
+        return {out_name: 1.0 / (1.0 + np.exp(-x))}
+
+    if otype == OpType.TANH:
+        x = tensor_values[op.inputs[0]]
+        return {out_name: np.tanh(x)}
+
+    if otype == OpType.SILU:
+        x = tensor_values[op.inputs[0]]
+        sig = 1.0 / (1.0 + np.exp(-x))
+        return {out_name: x * sig}
+
+    if otype == OpType.SOFTMAX:
+        x = tensor_values[op.inputs[0]]
+        axis = op.attrs.get('axis', -1)
+        e = np.exp(x - np.max(x, axis=axis, keepdims=True))
+        return {out_name: e / np.sum(e, axis=axis, keepdims=True)}
+
+    # ---- normalisation ----------------------------------------------------
+    if otype == OpType.LAYERNORM:
+        x = tensor_values[op.inputs[0]]
+        eps = op.attrs.get('eps', 1e-5)
+        # Normalise over the last N dims corresponding to normalized_shape
+        norm_shape = op.attrs.get('normalized_shape', (x.shape[-1],))
+        n_dims = len(norm_shape)
+        axes = tuple(range(-n_dims, 0))
+        mean = np.mean(x, axis=axes, keepdims=True)
+        var = np.var(x, axis=axes, keepdims=True)
+        x_norm = (x - mean) / np.sqrt(var + eps)
+        scale = op.weights.get('scale')
+        bias = op.weights.get('bias')
+        if scale is not None:
+            x_norm = x_norm * scale
+        if bias is not None:
+            x_norm = x_norm + bias
+        return {out_name: x_norm}
+
+    if otype == OpType.RMSNORM:
+        x = tensor_values[op.inputs[0]]
+        eps = op.attrs.get('eps', 1e-5)
+        ms = np.mean(x ** 2, axis=-1, keepdims=True)
+        x_norm = x / np.sqrt(ms + eps)
+        scale = op.weights.get('scale')
+        if scale is not None:
+            x_norm = x_norm * scale
+        return {out_name: x_norm}
+
+    if otype == OpType.BATCHNORM:
+        x = tensor_values[op.inputs[0]]
+        eps = op.attrs.get('eps', 1e-5)
+        rm = op.weights['running_mean']
+        rv = op.weights['running_var']
+        scale = op.weights.get('scale')
+        bias = op.weights.get('bias')
+        # x shape: (N, C, ...) or (C, ...)
+        # Determine the channel axis -- assume axis 0 if no batch dim,
+        # otherwise axis 1.
+        if x.ndim >= 3:
+            c_axis = 1 if x.shape[0] != len(rm) else 0
+        else:
+            c_axis = 0 if x.shape[0] == len(rm) else -1
+
+        # Build shape for broadcasting
+        bc_shape = [1] * x.ndim
+        bc_shape[c_axis] = len(rm)
+        bc_shape = tuple(bc_shape)
+
+        rm_b = rm.reshape(bc_shape)
+        rv_b = rv.reshape(bc_shape)
+        x_norm = (x - rm_b) / np.sqrt(rv_b + eps)
+        if scale is not None:
+            x_norm = x_norm * scale.reshape(bc_shape)
+        if bias is not None:
+            x_norm = x_norm + bias.reshape(bc_shape)
+        return {out_name: x_norm}
+
+    # ---- element-wise binary ----------------------------------------------
+    if otype == OpType.ADD:
+        a = tensor_values[op.inputs[0]]
+        b = tensor_values[op.inputs[1]]
+        return {out_name: a + b}
+
+    if otype == OpType.MULTIPLY:
+        a = tensor_values[op.inputs[0]]
+        b = tensor_values[op.inputs[1]]
+        return {out_name: a * b}
+
+    # ---- embedding --------------------------------------------------------
+    if otype == OpType.EMBEDDING:
+        indices = tensor_values[op.inputs[0]]
+        weight = op.weights['weight']   # (V, D)
+        return {out_name: weight[indices.astype(np.intp)]}
+
+    # ---- pooling ----------------------------------------------------------
+    if otype == OpType.MAXPOOL2D:
+        return {out_name: _pool2d_float(op, tensor_values, mode='max')}
+
+    if otype == OpType.AVGPOOL2D:
+        return {out_name: _pool2d_float(op, tensor_values, mode='avg')}
+
+    if otype == OpType.GLOBAL_AVGPOOL:
+        x = tensor_values[op.inputs[0]]
+        # Average over all spatial dims (everything after channel dim)
+        if x.ndim >= 3:
+            axes = tuple(range(2, x.ndim))
+        elif x.ndim == 2:
+            axes = (1,)
+        else:
+            axes = ()
+        return {out_name: np.mean(x, axis=axes, keepdims=False) if axes else x}
+
+    # ---- structural -------------------------------------------------------
+    if otype == OpType.RESHAPE:
+        x = tensor_values[op.inputs[0]]
+        target = op.attrs.get('target_shape', (-1,))
+        return {out_name: x.reshape(target)}
+
+    if otype == OpType.FLATTEN:
+        x = tensor_values[op.inputs[0]]
+        if x.ndim <= 1:
+            return {out_name: x}
+        # Preserve batch dimension (dim 0), flatten the rest
+        return {out_name: x.reshape(x.shape[0], -1) if x.ndim > 2 else x}
+
+    if otype == OpType.CONCAT:
+        arrays = [tensor_values[n] for n in op.inputs]
+        axis = op.attrs.get('axis', 0)
+        return {out_name: np.concatenate(arrays, axis=axis)}
+
+    # ---- multi-head attention ---------------------------------------------
+    if otype == OpType.MULTI_HEAD_ATTENTION:
+        return {out_name: _mha_float(op, tensor_values)}
+
+    raise ValueError(f"forward_op_float: unsupported op type {otype}")
+
+
+# ---------------------------------------------------------------------------
+#  Conv helpers (float)
+# ---------------------------------------------------------------------------
+
+def _conv2d_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
+    """Naive Conv2D forward: supports batched or unbatched input."""
+    x = tv[op.inputs[0]]
+    w = op.weights['weight']                       # (Co, Ci, kH, kW)
+    b = op.weights.get('bias')                     # (Co,) or None
+    Co, Ci, kH, kW = w.shape
+    sH, sW = op.attrs.get('stride', (1, 1))
+    pH, pW = op.attrs.get('padding', (0, 0))
+
+    # Handle batched vs unbatched input
+    batched = (x.ndim == 4)
+    if not batched:
+        x = x[np.newaxis]                          # (1, Ci, H, W)
+
+    N, _Ci, H, W = x.shape
+
+    # Zero-pad
+    if pH > 0 or pW > 0:
+        x = np.pad(x, ((0, 0), (0, 0), (pH, pH), (pW, pW)))
+
+    Hp = x.shape[2]
+    Wp = x.shape[3]
+    Ho = (Hp - kH) // sH + 1
+    Wo = (Wp - kW) // sW + 1
+
+    # im2col
+    col = np.zeros((N, Ci * kH * kW, Ho * Wo), dtype=x.dtype)
+    idx = 0
+    for i in range(Ho):
+        for j in range(Wo):
+            patch = x[:, :, i * sH: i * sH + kH, j * sW: j * sW + kW]
+            col[:, :, idx] = patch.reshape(N, -1)
+            idx += 1
+
+    w_mat = w.reshape(Co, -1)                      # (Co, Ci*kH*kW)
+    out = np.einsum('ij,njk->nik', w_mat, col)     # (N, Co, Ho*Wo)
+    out = out.reshape(N, Co, Ho, Wo)
+
+    if b is not None:
+        out = out + b[np.newaxis, :, np.newaxis, np.newaxis]
+
+    # Fused activation
+    act = op.attrs.get('activation', 'none')
+    if act == 'relu':
+        out = np.maximum(out, 0.0)
+
+    if not batched:
+        out = out[0]
+
+    return out
+
+
+def _conv1d_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
+    """Naive Conv1D forward."""
+    x = tv[op.inputs[0]]
+    w = op.weights['weight']                       # (Co, Ci, kW)
+    b = op.weights.get('bias')
+    Co, Ci, kW = w.shape
+    sW = op.attrs.get('stride', (1,))
+    if isinstance(sW, (tuple, list)):
+        sW = sW[0]
+    pW = op.attrs.get('padding', (0,))
+    if isinstance(pW, (tuple, list)):
+        pW = pW[0]
+
+    batched = (x.ndim == 3)
+    if not batched:
+        x = x[np.newaxis]                          # (1, Ci, W)
+
+    N, _Ci, W = x.shape
+    if pW > 0:
+        x = np.pad(x, ((0, 0), (0, 0), (pW, pW)))
+
+    Wp = x.shape[2]
+    Wo = (Wp - kW) // sW + 1
+
+    col = np.zeros((N, Ci * kW, Wo), dtype=x.dtype)
+    for j in range(Wo):
+        patch = x[:, :, j * sW: j * sW + kW]
+        col[:, :, j] = patch.reshape(N, -1)
+
+    w_mat = w.reshape(Co, -1)
+    out = np.einsum('ij,njk->nik', w_mat, col)
+    out = out.reshape(N, Co, Wo)
+
+    if b is not None:
+        out = out + b[np.newaxis, :, np.newaxis]
+
+    if not batched:
+        out = out[0]
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Pool helper (float)
+# ---------------------------------------------------------------------------
+
+def _pool2d_float(
+    op: Operation,
+    tv: Dict[str, np.ndarray],
+    mode: str = 'max',
+) -> np.ndarray:
+    """Naive maxpool2d / avgpool2d forward."""
+    x = tv[op.inputs[0]]
+    kH, kW = op.attrs.get('kernel_size', (2, 2))
+    sH, sW = op.attrs.get('stride', (kH, kW))
+    pH, pW = op.attrs.get('padding', (0, 0))
+
+    batched = (x.ndim == 4)
+    if not batched:
+        x = x[np.newaxis]
+
+    N, C, H, W = x.shape
+    if pH > 0 or pW > 0:
+        pad_val = -1e30 if mode == 'max' else 0.0
+        x_pad = np.full((N, C, H + 2 * pH, W + 2 * pW), pad_val, dtype=x.dtype)
+        x_pad[:, :, pH:pH + H, pW:pW + W] = x
+        x = x_pad
+
+    Hp = x.shape[2]
+    Wp = x.shape[3]
+    Ho = (Hp - kH) // sH + 1
+    Wo = (Wp - kW) // sW + 1
+
+    out = np.zeros((N, C, Ho, Wo), dtype=x.dtype)
+    for i in range(Ho):
+        for j in range(Wo):
+            window = x[:, :, i * sH: i * sH + kH, j * sW: j * sW + kW]
+            if mode == 'max':
+                out[:, :, i, j] = window.reshape(N, C, -1).max(axis=-1)
+            else:
+                out[:, :, i, j] = window.reshape(N, C, -1).mean(axis=-1)
+
+    if not batched:
+        out = out[0]
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Multi-head attention (float)
+# ---------------------------------------------------------------------------
+
+def _mha_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Full multi-head attention forward pass.
+
+    Expects op.weights to contain q_weight, q_bias, k_weight, k_bias,
+    v_weight, v_bias, out_weight, out_bias.
+
+    Input is assumed to be a single tensor of shape (..., seq_len, embed_dim).
+    For simplicity, self-attention is assumed (Q, K, V all derived from the
+    same input).
+    """
+    x = tv[op.inputs[0]]
+
+    num_heads = op.attrs['num_heads']
+    head_dim = op.attrs['head_dim']
+    embed_dim = op.attrs.get('embed_dim', num_heads * head_dim)
+
+    Wq = op.weights['q_weight']   # (E, E)
+    bq = op.weights.get('q_bias')
+    Wk = op.weights['k_weight']
+    bk = op.weights.get('k_bias')
+    Wv = op.weights['v_weight']
+    bv = op.weights.get('v_bias')
+    Wo = op.weights['out_weight']
+    bo = op.weights.get('out_bias')
+
+    # Linear projections
+    Q = x @ Wq.T
+    K = x @ Wk.T
+    V = x @ Wv.T
+    if bq is not None:
+        Q = Q + bq
+    if bk is not None:
+        K = K + bk
+    if bv is not None:
+        V = V + bv
+
+    # Determine batch/sequence dims.  x can be (seq, E), (B, seq, E), etc.
+    orig_shape = Q.shape
+    if Q.ndim == 2:
+        # (seq, E)  -- treat as single batch
+        seq_len = orig_shape[0]
+        Q = Q.reshape(1, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(1, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(1, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    elif Q.ndim == 3:
+        # (B, seq, E)
+        B, seq_len, _ = orig_shape
+        Q = Q.reshape(B, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(B, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(B, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    else:
+        raise ValueError(f"MHA: unexpected input ndim {Q.ndim}")
+
+    # Scaled dot-product attention
+    scale = math.sqrt(head_dim)
+    scores = np.matmul(Q, K.transpose(0, 1, 3, 2)) / scale  # (B, H, S, S)
+    # Softmax over last axis
+    scores_max = np.max(scores, axis=-1, keepdims=True)
+    e = np.exp(scores - scores_max)
+    attn = e / np.sum(e, axis=-1, keepdims=True)
+
+    # Weighted sum
+    ctx = np.matmul(attn, V)   # (B, H, S, head_dim)
+
+    # Concat heads
+    if orig_shape[-1] == embed_dim and len(orig_shape) == 2:
+        ctx = ctx.transpose(0, 2, 1, 3).reshape(1, seq_len, embed_dim)
+        ctx = ctx[0]  # back to (seq, E)
+    else:
+        B = ctx.shape[0]
+        seq_len = ctx.shape[2]
+        ctx = ctx.transpose(0, 2, 1, 3).reshape(B, seq_len, embed_dim)
+
+    # Output projection
+    out = ctx @ Wo.T
+    if bo is not None:
+        out = out + bo
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Quantize tensor
+# ---------------------------------------------------------------------------
+
+def quantize_tensor(
+    arr: np.ndarray,
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+    axis: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Quantize a float tensor.
+
+    Returns (quantized_int_array, scales).
+
+    For PER_TENSOR: scales is a 1-element array.
+    For PER_CHANNEL: scales has shape (arr.shape[axis],).
+    """
+    if granularity == QuantGranularity.PER_CHANNEL and arr.ndim >= 2:
+        n_channels = arr.shape[axis]
+        scales = np.zeros(n_channels, dtype=np.float64)
+        q_arr = np.zeros_like(arr, dtype=np.int64)
+
+        for c in range(n_channels):
+            # Slice along the channel axis
+            slc = [slice(None)] * arr.ndim
+            slc[axis] = c
+            channel_data = arr[tuple(slc)]
+
+            q_channel, s = _quantize_1d(channel_data, bits, scheme)
+            q_arr[tuple(slc)] = q_channel
+            scales[c] = s
+
+        return q_arr, scales
+    else:
+        q_arr, s = _quantize_1d(arr, bits, scheme)
+        return q_arr, np.array([s], dtype=np.float64)
+
+
+def _quantize_1d(
+    arr: np.ndarray,
+    bits: int,
+    scheme: QuantScheme,
+) -> Tuple[np.ndarray, float]:
+    """
+    Quantize a tensor with a single (per-tensor) scale.
+
+    Returns (int_array, scale_float).
+    """
+    arr = arr.astype(np.float64)
+
+    if scheme == QuantScheme.SYMMETRIC:
+        qmax = (1 << (bits - 1)) - 1                       # 127 for 8-bit
+        abs_max = float(np.max(np.abs(arr)))
+        if abs_max < 1e-30:
+            abs_max = 1e-30
+        scale = qmax / abs_max
+        q = np.clip(np.round(arr * scale), -qmax, qmax).astype(np.int64)
+        return q, scale
+
+    else:  # ASYMMETRIC
+        qmin_int = -(1 << (bits - 1))                      # -128 for 8-bit
+        qmax_int = (1 << (bits - 1)) - 1                   # 127
+
+        lo = float(np.min(arr))
+        hi = float(np.max(arr))
+        if hi - lo < 1e-30:
+            hi = lo + 1e-30
+
+        scale = (hi - lo) / (qmax_int - qmin_int)
+        zero_point = round(-lo / scale) + qmin_int
+        zero_point = int(np.clip(zero_point, qmin_int, qmax_int))
+
+        q = np.clip(np.round(arr / scale + zero_point), qmin_int, qmax_int)
+        q = q.astype(np.int64)
+        # For asymmetric we return the inverse scale (values-per-unit) so
+        # that the requantization logic stays uniform.  The Verilog backend
+        # only uses symmetric mode, but the calibration path may request
+        # asymmetric.
+        return q, 1.0 / scale
+
+
+# ---------------------------------------------------------------------------
+#  Requantization parameter computation
+# ---------------------------------------------------------------------------
+
+def compute_requant(
+    input_scale: float,
+    weight_scale: float,
+    output_scale: float,
+    shift: int = 16,
+) -> Tuple[int, int]:
+    """
+    Compute integer requantization multiplier and shift.
+
+    After MAC:  acc = sum(w_q * x_q) + b_q
+    acc is in scale  (input_scale * weight_scale).
+
+    To convert to output scale:
+        out_q = (acc * M) >> S
+
+    where:
+        M = round(output_scale / (input_scale * weight_scale) * 2^S)
+
+    If M overflows a 32-bit signed integer we bump S until it fits.
+    """
+    acc_scale = input_scale * weight_scale
+    if acc_scale < 1e-30:
+        acc_scale = 1e-30
+    if output_scale < 1e-30:
+        output_scale = 1e-30
+
+    ratio = output_scale / acc_scale
+
+    # Try the requested shift; increase if M overflows int32
+    for s in range(shift, shift + 16):
+        M = round(ratio * (1 << s))
+        if abs(M) <= 0x7FFFFFFF:
+            return int(M), int(s)
+
+    # Fallback: use the largest valid multiplier
+    s = shift
+    M = round(ratio * (1 << s))
+    M = max(-0x7FFFFFFF, min(0x7FFFFFFF, M))
+    return int(M), int(s)
+
+
+# ---------------------------------------------------------------------------
+#  Internal helpers
+# ---------------------------------------------------------------------------
+
+def _scale_from_range(
+    lo: float, hi: float, bits: int, scheme: QuantScheme
+) -> float:
+    """Derive a quantization scale from an observed min/max range."""
+    if scheme == QuantScheme.SYMMETRIC:
+        qmax = (1 << (bits - 1)) - 1
+        abs_max = max(abs(lo), abs(hi))
+        if abs_max < 1e-30:
+            abs_max = 1e-30
+        return qmax / abs_max
+    else:
+        qmin_int = -(1 << (bits - 1))
+        qmax_int = (1 << (bits - 1)) - 1
+        span = hi - lo
+        if span < 1e-30:
+            span = 1e-30
+        scale = (qmax_int - qmin_int) / span
+        return scale
+
+
+# Ops that carry weight tensors needing quantization
+_WEIGHTED_OPS = {
+    OpType.DENSE,
+    OpType.CONV1D,
+    OpType.CONV2D,
+    OpType.LAYERNORM,
+    OpType.RMSNORM,
+    OpType.BATCHNORM,
+    OpType.MULTI_HEAD_ATTENTION,
+    OpType.EMBEDDING,
+}
+
+
+def _quantize_op(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Quantize one operation in-place."""
+    if op.op_type not in _WEIGHTED_OPS:
+        return
+    if not op.weights:
+        return
+
+    # ---- quantize each weight tensor ------------------------------------
+    for wname, warr in op.weights.items():
+        # Running stats (batchnorm) are not quantized -- they are folded
+        # into scale/bias during inference.
+        if wname in ('running_mean', 'running_var'):
+            continue
+
+        q_arr, w_scales = quantize_tensor(
+            warr, bits, scheme, granularity, axis=0,
+        )
+        op.q_weights[wname] = q_arr
+
+    # ---- requantization parameters (only for MAC-style ops) -------------
+    if op.op_type in (OpType.DENSE, OpType.CONV1D, OpType.CONV2D):
+        _compute_mac_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type == OpType.MULTI_HEAD_ATTENTION:
+        _compute_mha_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type in (OpType.LAYERNORM, OpType.RMSNORM, OpType.BATCHNORM):
+        _compute_norm_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type == OpType.EMBEDDING:
+        _compute_embedding_requant(op, tensor_scales, bits, scheme, granularity)
+
+
+def _compute_mac_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute requantization params for DENSE / CONV1D / CONV2D."""
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    input_scale = tensor_scales.get(input_name, 1.0)
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    weight = op.weights['weight']
+
+    # Quantize the weight tensor and get its scales
+    q_w, w_scales = quantize_tensor(
+        weight, bits, scheme, granularity, axis=0,
+    )
+    op.q_weights['weight'] = q_w
+
+    # Quantize bias in the accumulator scale (input_scale * weight_scale)
+    bias = op.weights.get('bias')
+    if bias is not None:
+        if granularity == QuantGranularity.PER_CHANNEL and weight.ndim >= 2:
+            # Each output channel has its own bias scale
+            bias_q = np.zeros_like(bias, dtype=np.int64)
+            for c in range(len(bias)):
+                bias_scale = input_scale * w_scales[c]
+                if bias_scale < 1e-30:
+                    bias_scale = 1e-30
+                bias_q[c] = int(round(bias[c] * bias_scale))
+            op.q_weights['bias'] = bias_q
+        else:
+            ws = w_scales[0] if len(w_scales) == 1 else w_scales
+            if isinstance(ws, np.ndarray) and ws.size == 1:
+                ws = float(ws)
+            bias_scale = input_scale * float(ws)
+            if bias_scale < 1e-30:
+                bias_scale = 1e-30
+            op.q_weights['bias'] = np.round(bias * bias_scale).astype(np.int64)
+
+    # Determine accumulator bit-width
+    if weight.ndim == 2:
+        n_in = weight.shape[1]
+    elif weight.ndim == 3:
+        n_in = weight.shape[1] * weight.shape[2]       # Conv1D
+    elif weight.ndim == 4:
+        n_in = weight.shape[1] * weight.shape[2] * weight.shape[3]  # Conv2D
+    else:
+        n_in = int(np.prod(weight.shape[1:]))
+    a_bits = acc_bits_for(n_in, bits)
+
+    # Compute requantization multiplier(s)
+    if granularity == QuantGranularity.PER_CHANNEL and weight.ndim >= 2:
+        n_out = weight.shape[0]
+        requant_mults = np.zeros(n_out, dtype=np.int64)
+        shift = 16
+        for c in range(n_out):
+            m, s = compute_requant(input_scale, w_scales[c], output_scale, shift)
+            requant_mults[c] = m
+            shift = s                      # keep the same shift for all channels
+        op.q_params = {
+            'requant_mult': requant_mults,
+            'requant_shift': shift,
+            'input_scale': float(input_scale),
+            'weight_scale': w_scales,
+            'output_scale': float(output_scale),
+            'acc_bits': a_bits,
+        }
+    else:
+        ws = float(w_scales[0])
+        m, s = compute_requant(input_scale, ws, output_scale)
+        op.q_params = {
+            'requant_mult': m,
+            'requant_shift': s,
+            'input_scale': float(input_scale),
+            'weight_scale': ws,
+            'output_scale': float(output_scale),
+            'acc_bits': a_bits,
+        }
+
+
+def _compute_mha_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute requantization params for multi-head attention."""
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    input_scale = tensor_scales.get(input_name, 1.0)
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    embed_dim = op.attrs.get(
+        'embed_dim',
+        op.attrs['num_heads'] * op.attrs['head_dim'],
+    )
+    a_bits = acc_bits_for(embed_dim, bits)
+
+    # Quantize all weight matrices
+    proj_names = [
+        'q_weight', 'k_weight', 'v_weight', 'out_weight',
+        'q_bias', 'k_bias', 'v_bias', 'out_bias',
+    ]
+    w_scale_map = {}
+    for pname in proj_names:
+        if pname in op.weights:
+            warr = op.weights[pname]
+            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
+            op.q_weights[pname] = q_arr
+            w_scale_map[pname] = float(ws[0]) if ws.size == 1 else ws
+
+    # Use the output projection scale for the final requantization
+    out_ws = w_scale_map.get('out_weight', 1.0)
+    if isinstance(out_ws, np.ndarray):
+        out_ws = float(out_ws[0])
+    m, s = compute_requant(input_scale, out_ws, output_scale)
+
+    op.q_params = {
+        'requant_mult': m,
+        'requant_shift': s,
+        'input_scale': float(input_scale),
+        'weight_scale': w_scale_map,
+        'output_scale': float(output_scale),
+        'acc_bits': a_bits,
+    }
+
+
+def _compute_norm_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute requantization params for normalization layers."""
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    input_scale = tensor_scales.get(input_name, 1.0)
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    # Norm layers have a scale (gamma) tensor -- use its mean magnitude
+    # as a proxy for the weight scale in the requantization math.
+    scale_w = op.weights.get('scale')
+    if scale_w is not None:
+        q_arr, ws = quantize_tensor(scale_w, bits, scheme, granularity, axis=0)
+        op.q_weights['scale'] = q_arr
+        ws_float = float(ws[0]) if ws.size == 1 else float(np.mean(ws))
+    else:
+        ws_float = 1.0
+
+    bias_w = op.weights.get('bias')
+    if bias_w is not None:
+        q_arr, _ = quantize_tensor(bias_w, bits, scheme, granularity, axis=0)
+        op.q_weights['bias'] = q_arr
+
+    m, s = compute_requant(input_scale, ws_float, output_scale)
+    a_bits = acc_bits_for(
+        int(scale_w.shape[0]) if scale_w is not None else 1,
+        bits,
+    )
+
+    op.q_params = {
+        'requant_mult': m,
+        'requant_shift': s,
+        'input_scale': float(input_scale),
+        'weight_scale': ws_float,
+        'output_scale': float(output_scale),
+        'acc_bits': a_bits,
+    }
+
+
+def _compute_embedding_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute requantization params for embedding lookup."""
+    output_name = op.outputs[0]
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    weight = op.weights['weight']                   # (V, D)
+    q_arr, ws = quantize_tensor(weight, bits, scheme, granularity, axis=0)
+    op.q_weights['weight'] = q_arr
+    ws_float = float(ws[0]) if ws.size == 1 else ws
+
+    op.q_params = {
+        'requant_mult': 1,
+        'requant_shift': 0,
+        'input_scale': 1.0,                         # no input scale for embeddings
+        'weight_scale': ws_float,
+        'output_scale': float(output_scale),
+        'acc_bits': bits,
+    }
