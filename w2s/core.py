@@ -6,6 +6,7 @@ This is the single source of truth for the IR (intermediate representation).
 """
 
 import numpy as np
+from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 from enum import Enum
@@ -213,11 +214,11 @@ class ComputeGraph:
             in_degree[op.name] = deg
 
         op_map = {op.name: op for op in self.operations}
-        queue = [n for n, d in in_degree.items() if d == 0]
+        queue = deque(n for n, d in in_degree.items() if d == 0)
         order: List[Operation] = []
 
         while queue:
-            n = queue.pop(0)
+            n = queue.popleft()
             order.append(op_map[n])
             for dep in fwd.get(n, []):
                 in_degree[dep] -= 1

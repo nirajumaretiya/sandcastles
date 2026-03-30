@@ -5,6 +5,8 @@ This is the orchestrator. It dispatches each operation to the appropriate
 Verilog generator and wires the results together into a complete module.
 """
 
+import warnings
+
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
@@ -16,110 +18,56 @@ from w2s import emit
 
 
 # ---------------------------------------------------------------------------
-#  Generator registry
+#  Generator dispatch
 # ---------------------------------------------------------------------------
 
-# Maps OpType -> generator function
-# Each generator: (op, wire_map, bits) -> (verilog_lines, new_wires)
-_GENERATORS: Dict[OpType, Callable] = {}
+_module_map = {
+    OpType.DENSE: ("w2s.generators.dense", "generate_dense"),
+    OpType.CONV1D: ("w2s.generators.conv", "generate_conv1d"),
+    OpType.CONV2D: ("w2s.generators.conv", "generate_conv2d"),
+    OpType.RELU: ("w2s.generators.activation", "generate_relu"),
+    OpType.GELU: ("w2s.generators.activation", "generate_gelu"),
+    OpType.SIGMOID: ("w2s.generators.activation", "generate_sigmoid"),
+    OpType.TANH: ("w2s.generators.activation", "generate_tanh"),
+    OpType.SILU: ("w2s.generators.activation", "generate_silu"),
+    OpType.SOFTMAX: ("w2s.generators.activation", "generate_softmax"),
+    OpType.LAYERNORM: ("w2s.generators.norm", "generate_layernorm"),
+    OpType.RMSNORM: ("w2s.generators.norm", "generate_rmsnorm"),
+    OpType.BATCHNORM: ("w2s.generators.norm", "generate_batchnorm"),
+    OpType.MULTI_HEAD_ATTENTION: ("w2s.generators.attention", "generate_mha"),
+    OpType.GROUPED_QUERY_ATTENTION: ("w2s.generators.transformer", "generate_gqa"),
+    OpType.SWIGLU: ("w2s.generators.transformer", "generate_swiglu"),
+    OpType.ROPE: ("w2s.generators.transformer", "generate_rope"),
+    OpType.KV_CACHE: ("w2s.generators.transformer", "generate_kv_cache"),
+    OpType.EMBEDDING: ("w2s.generators.embedding", "generate_embedding"),
+    OpType.MAXPOOL2D: ("w2s.generators.pooling", "generate_maxpool2d"),
+    OpType.AVGPOOL2D: ("w2s.generators.pooling", "generate_avgpool2d"),
+    OpType.GLOBAL_AVGPOOL: ("w2s.generators.pooling", "generate_global_avgpool"),
+    OpType.ADD: ("w2s.generators.structural", "generate_add"),
+    OpType.MULTIPLY: ("w2s.generators.structural", "generate_multiply"),
+    OpType.RESHAPE: ("w2s.generators.structural", "generate_reshape"),
+    OpType.FLATTEN: ("w2s.generators.structural", "generate_flatten"),
+    OpType.CONCAT: ("w2s.generators.structural", "generate_concat"),
+}
 
+# Cache for already-imported generator functions
+_generator_cache: Dict[OpType, Callable] = {}
 
-def register(op_type: OpType):
-    """Decorator to register a generator function for an op type."""
-    def wrapper(fn):
-        _GENERATORS[op_type] = fn
-        return fn
-    return wrapper
-
-
-def _load_generators():
-    """Import all generator modules to trigger their @register decorators."""
-    # Import each generator module — they self-register via @register
-    try:
-        from w2s.generators import dense
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import conv
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import activation
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import norm
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import attention
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import embedding
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import pooling
-    except ImportError:
-        pass
-    try:
-        from w2s.generators import structural
-    except ImportError:
-        pass
-
-
-# ---------------------------------------------------------------------------
-#  Alternative: explicit dispatch (works even without @register)
-# ---------------------------------------------------------------------------
 
 def _get_generator(op_type: OpType) -> Optional[Callable]:
-    """Look up the generator for an op type, trying registry first."""
-    if op_type in _GENERATORS:
-        return _GENERATORS[op_type]
-
-    # Fallback: import directly and look up by convention
-    _module_map = {
-        OpType.DENSE: ("w2s.generators.dense", "generate_dense"),
-        OpType.CONV1D: ("w2s.generators.conv", "generate_conv1d"),
-        OpType.CONV2D: ("w2s.generators.conv", "generate_conv2d"),
-        OpType.RELU: ("w2s.generators.activation", "generate_relu"),
-        OpType.GELU: ("w2s.generators.activation", "generate_gelu"),
-        OpType.SIGMOID: ("w2s.generators.activation", "generate_sigmoid"),
-        OpType.TANH: ("w2s.generators.activation", "generate_tanh"),
-        OpType.SILU: ("w2s.generators.activation", "generate_silu"),
-        OpType.SOFTMAX: ("w2s.generators.activation", "generate_softmax"),
-        OpType.LAYERNORM: ("w2s.generators.norm", "generate_layernorm"),
-        OpType.RMSNORM: ("w2s.generators.norm", "generate_rmsnorm"),
-        OpType.BATCHNORM: ("w2s.generators.norm", "generate_batchnorm"),
-        OpType.MULTI_HEAD_ATTENTION: ("w2s.generators.attention", "generate_mha"),
-        OpType.GROUPED_QUERY_ATTENTION: ("w2s.generators.transformer", "generate_gqa"),
-        OpType.SWIGLU: ("w2s.generators.transformer", "generate_swiglu"),
-        OpType.ROPE: ("w2s.generators.transformer", "generate_rope"),
-        OpType.KV_CACHE: ("w2s.generators.transformer", "generate_kv_cache"),
-        OpType.EMBEDDING: ("w2s.generators.embedding", "generate_embedding"),
-        OpType.MAXPOOL2D: ("w2s.generators.pooling", "generate_maxpool2d"),
-        OpType.AVGPOOL2D: ("w2s.generators.pooling", "generate_avgpool2d"),
-        OpType.GLOBAL_AVGPOOL: ("w2s.generators.pooling", "generate_global_avgpool"),
-        OpType.ADD: ("w2s.generators.structural", "generate_add"),
-        OpType.MULTIPLY: ("w2s.generators.structural", "generate_multiply"),
-        OpType.RESHAPE: ("w2s.generators.structural", "generate_reshape"),
-        OpType.FLATTEN: ("w2s.generators.structural", "generate_flatten"),
-        OpType.CONCAT: ("w2s.generators.structural", "generate_concat"),
-    }
+    """Look up the generator for an op type via the module map."""
+    if op_type in _generator_cache:
+        return _generator_cache[op_type]
 
     if op_type not in _module_map:
         return None
 
     mod_name, fn_name = _module_map[op_type]
-    try:
-        import importlib
-        mod = importlib.import_module(mod_name)
-        fn = getattr(mod, fn_name)
-        _GENERATORS[op_type] = fn  # cache for next time
-        return fn
-    except (ImportError, AttributeError):
-        return None
+    import importlib
+    mod = importlib.import_module(mod_name)
+    fn = getattr(mod, fn_name)
+    _generator_cache[op_type] = fn
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +95,6 @@ def compile_graph(
         from w2s.sequential.compile import compile_sequential
         return compile_sequential(graph, output_dir)
 
-    _load_generators()
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -214,16 +161,13 @@ def compile_graph(
 
         try:
             new_lines, new_wires = gen(op, wire_map, bits)
-            op_lines.extend(new_lines)
-            op_lines.append("")
-            wire_map.update(new_wires)
         except Exception as e:
-            op_lines.append(f"    // ERROR generating {op.name} ({op.op_type.value}): {e}")
-            op_lines.append("")
-            # Pass through
-            if op.inputs and op.inputs[0] in wire_map:
-                for out_name in op.outputs:
-                    wire_map[out_name] = wire_map[op.inputs[0]]
+            raise RuntimeError(
+                f"Failed to generate Verilog for op '{op.name}' ({op.op_type.name}): {e}"
+            ) from e
+        op_lines.extend(new_lines)
+        op_lines.append("")
+        wire_map.update(new_wires)
 
     # --- Output ports ---
     out_ports: List[Tuple[str, int]] = []
@@ -432,10 +376,39 @@ def _forward_op_int(
     elif op.op_type == OpType.RELU:
         tensors[op.outputs[0]] = np.maximum(0, _get(op.inputs[0]))
 
-    elif op.op_type in (OpType.GELU, OpType.SIGMOID, OpType.TANH, OpType.SILU):
-        # For quantized activations, apply float then requantize
-        # (simplified — real impl would use the same PWL as Verilog)
-        tensors[op.outputs[0]] = _get(op.inputs[0])  # pass-through placeholder
+    elif op.op_type == OpType.SIGMOID:
+        x = _get(op.inputs[0])
+        x_float = x.astype(np.float64) / qmax
+        sig = 1.0 / (1.0 + np.exp(-x_float))
+        tensors[op.outputs[0]] = np.clip(
+            np.round(sig * qmax), 0, qmax
+        ).astype(np.int64)
+
+    elif op.op_type == OpType.TANH:
+        x = _get(op.inputs[0])
+        x_float = x.astype(np.float64) / qmax
+        tensors[op.outputs[0]] = np.clip(
+            np.round(np.tanh(x_float) * qmax), -qmax, qmax
+        ).astype(np.int64)
+
+    elif op.op_type == OpType.GELU:
+        x = _get(op.inputs[0])
+        x_float = x.astype(np.float64) / qmax
+        gelu_float = x_float * 0.5 * (
+            1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x_float + 0.044715 * x_float ** 3))
+        )
+        tensors[op.outputs[0]] = np.clip(
+            np.round(gelu_float * qmax), -qmax, qmax
+        ).astype(np.int64)
+
+    elif op.op_type == OpType.SILU:
+        x = _get(op.inputs[0])
+        x_float = x.astype(np.float64) / qmax
+        sig = 1.0 / (1.0 + np.exp(-x_float))
+        silu_float = x_float * sig
+        tensors[op.outputs[0]] = np.clip(
+            np.round(silu_float * qmax), -qmax, qmax
+        ).astype(np.int64)
 
     elif op.op_type == OpType.ADD:
         a = _get(op.inputs[0])
@@ -541,6 +514,7 @@ def _forward_op_int(
 
     else:
         # Passthrough for unhandled ops
+        warnings.warn(f"forward_int: op type {op.op_type.name} not implemented, passing through input")
         if op.inputs and op.inputs[0] in tensors:
             tensors[op.outputs[0]] = _get(op.inputs[0])
 

@@ -352,6 +352,9 @@ def generate_rope(
     lines += emit.section_comment("Rotation: multiply-and-add per pair")
     lines.append("")
 
+    # Products of two acc_bits-wide values need 2*acc_bits bits
+    rope_prod_bits = 2 * acc_bits
+
     out_wire_names: List[str] = [""] * dim
 
     for d in range(half):
@@ -373,14 +376,15 @@ def generate_rope(
         lines.append(emit.sign_extend_wire(sin_w, bits, sin_se, acc_bits))
 
         # out[d] = x[d]*cos - x[d+half]*sin
+        # Use wider intermediate to avoid product overflow
         acc_lo = f"{rpfx}_acc_lo"
         lines.append(
-            f"    wire signed [{acc_bits - 1}:0] {acc_lo} = "
+            f"    wire signed [{rope_prod_bits - 1}:0] {acc_lo} = "
             f"({x_lo_se} * {cos_se}) - ({x_hi_se} * {sin_se});"
         )
 
         rq_lines, shifted_lo = emit.requantize_lines(
-            acc_lo, acc_bits, requant_mult, requant_shift,
+            acc_lo, rope_prod_bits, requant_mult, requant_shift,
             prefix=f"{rpfx}_lo",
         )
         lines += rq_lines
@@ -389,14 +393,15 @@ def generate_rope(
         out_wire_names[d] = out_lo
 
         # out[d+half] = x[d]*sin + x[d+half]*cos
+        # Use wider intermediate to avoid product overflow
         acc_hi = f"{rpfx}_acc_hi"
         lines.append(
-            f"    wire signed [{acc_bits - 1}:0] {acc_hi} = "
+            f"    wire signed [{rope_prod_bits - 1}:0] {acc_hi} = "
             f"({x_lo_se} * {sin_se}) + ({x_hi_se} * {cos_se});"
         )
 
         rq_lines, shifted_hi = emit.requantize_lines(
-            acc_hi, acc_bits, requant_mult, requant_shift,
+            acc_hi, rope_prod_bits, requant_mult, requant_shift,
             prefix=f"{rpfx}_hi",
         )
         lines += rq_lines
@@ -654,17 +659,47 @@ def generate_gqa(
             lines[-1] += ";"
             lines.append("")
 
-            # (c) Reciprocal
+            # (c) Reciprocal via LUT (no variable-divisor division).
+            #     After ReLU the scores are non-negative, so the sum
+            #     ranges from 0 to seq_len * max_positive.  For each
+            #     possible sum value s we precompute
+            #         recip = round(scale_factor / s)
+            #     then multiply-and-shift instead of dividing.
             recip_bits = norm_bits + frac_shift
             recip_wire = f"{rpfx}_recip"
             numer = one_fp << frac_shift
+
+            max_relu_val = (1 << (bits - 1)) - 1
+            max_sum_val = seq_len * max_relu_val
+            sum_ubits = max(1, max_sum_val.bit_length())
+
+            # Cap reciprocal LUT at 4096 entries to keep synthesis
+            # tractable.  For sums beyond the LUT range we reuse the
+            # last entry -- the reciprocal is monotonically decreasing
+            # so this is a safe (slightly over-weighted) approximation.
+            lut_max = min(max_sum_val, 4096)
+
+            lines.append(f"    reg signed [{recip_bits - 1}:0] {recip_wire};")
+            lines.append(f"    always @(*) begin")
+            lines.append(f"        case ({sum_wire}[{sum_ubits - 1}:0])")
+            for s in range(1, lut_max + 1):
+                rv = int(round(numer / s))
+                rv = min(rv, (1 << (recip_bits - 1)) - 1)
+                lines.append(
+                    f"            {sum_ubits}'d{s}: {recip_wire} = "
+                    f"{emit.slit(recip_bits, rv)};"
+                )
+            # For sums > lut_max, use the last LUT entry's value as default
+            if max_sum_val > 4096:
+                default_rv = int(round(numer / lut_max))
+                default_rv = min(default_rv, (1 << (recip_bits - 1)) - 1)
+            else:
+                default_rv = 0
             lines.append(
-                f"    wire signed [{recip_bits - 1}:0] {recip_wire} = "
-                f"({sum_wire} == {norm_bits}'sd0) "
-                f"? {recip_bits}'sd0 "
-                f": ({emit.slit(recip_bits, numer)} / "
-                f"{{{{{recip_bits - norm_bits}{{{sum_wire}[{norm_bits - 1}]}}}}, {sum_wire}}});"
+                f"            default: {recip_wire} = {emit.slit(recip_bits, default_rv)};"
             )
+            lines.append(f"        endcase")
+            lines.append(f"    end")
             lines.append("")
 
             # (d) Normalised attention weights
@@ -803,6 +838,10 @@ def generate_kv_cache(
     pos_wire = pos_tw.wire_names[0]
     out_name = op.outputs[0]
 
+    # -- Clock and write-enable inputs --
+    clk_wire = f"{pfx}_clk"
+    wr_en_wire = f"{pfx}_wr_en"
+
     lines: List[str] = []
 
     lines += emit.section_comment(
@@ -811,15 +850,19 @@ def generate_kv_cache(
     )
     lines.append("")
 
+    # Declare clk and wr_en as input wires
+    lines.append(f"    input {clk_wire};")
+    lines.append(f"    input {wr_en_wire};")
+    lines.append("")
+
     # ==================================================================
     #  Register file declaration
     # ==================================================================
     #
     #  reg signed [bits-1:0] cache_mem [0:total_elems-1];
     #
-    #  On each evaluation cycle:
-    #    - Write: store the incoming vector at the position offset
-    #    - Read: all entries are exposed as output wires
+    #  Writes are clocked (posedge clk) and gated by wr_en.
+    #  Reads are combinational -- all entries exposed as output wires.
     # ==================================================================
 
     lines.append(
@@ -828,17 +871,21 @@ def generate_kv_cache(
     )
     lines.append("")
 
-    # -- Write logic: store new vector at position --
-    lines += emit.section_comment("Write: store new K/V vector at position")
+    # -- Write logic: clocked store of new vector at position --
+    lines += emit.section_comment(
+        "Write: store new K/V vector at position (clocked)"
+    )
     lines.append("")
 
-    lines.append(f"    always @(*) begin")
+    lines.append(f"    always @(posedge {clk_wire}) begin")
+    lines.append(f"        if ({wr_en_wire}) begin")
     for d in range(vec_dim):
         addr_expr = f"{pos_wire}[{pos_bits - 1}:0] * {vec_dim} + {d}"
         lines.append(
-            f"        {pfx}_mem[{addr_expr}] = "
+            f"            {pfx}_mem[{addr_expr}] <= "
             f"{in_tw.wire_names[d]};"
         )
+    lines.append(f"        end")
     lines.append(f"    end")
     lines.append("")
 
@@ -867,7 +914,19 @@ def generate_kv_cache(
             shape=(max_seq_len, vec_dim),
             bits=bits,
             signed=True,
-        )
+        ),
+        f"{pfx}_clk": TensorWires(
+            wire_names=[clk_wire],
+            shape=(1,),
+            bits=1,
+            signed=False,
+        ),
+        f"{pfx}_wr_en": TensorWires(
+            wire_names=[wr_en_wire],
+            shape=(1,),
+            bits=1,
+            signed=False,
+        ),
     }
 
     return lines, new_wires

@@ -31,9 +31,10 @@ def generate_dense(
     """
     # --- Unpack weights and parameters ---
     weight = op.q_weights['weight']                 # (n_out, n_in)
-    bias = op.q_weights['bias']                     # (n_out,)
-    weight_f = op.weights['weight']                 # float, for comments
     n_out, n_in = weight.shape
+    bias = op.q_weights.get('bias', np.zeros(n_out, dtype=np.int64))  # (n_out,)
+    weight_f = op.weights['weight']                 # float, for comments
+    bias_f = op.weights.get('bias', np.zeros(n_out, dtype=np.float64))  # float, for comments
 
     requant_mult = op.q_params['requant_mult']      # int or ndarray
     requant_shift = op.q_params['requant_shift']     # int
@@ -103,7 +104,7 @@ def generate_dense(
             lines.append(f"    wire signed [{acc_bits - 1}:0] {acc_name} =")
             all_terms = list(terms)
             # Add bias as last term
-            bias_comment = f"bias={op.weights['bias'][j]:.4f}" if bias_val != 0 else ""
+            bias_comment = f"bias={bias_f[j]:.4f}" if bias_val != 0 else ""
             if bias_val != 0:
                 all_terms.append(emit.slit(acc_bits, bias_val))
 

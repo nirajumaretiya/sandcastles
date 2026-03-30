@@ -14,6 +14,7 @@ Pipeline:
   6. Concat heads                (wire remapping, zero logic)
   7. Output projection           (dense layer with hardwired weights)
 """
+from __future__ import annotations
 
 import math
 import numpy as np
@@ -263,21 +264,51 @@ def generate_mha(
             lines[-1] += ";"
             lines.append("")
 
-            # (c) Approximate reciprocal of sum.
-            #     reciprocal ~= (one_fp << frac_shift) / sum
-            #     We emit this as a conditional (sum == 0 -> 0, else divide).
-            #     Verilog / is synthesisable for constant-width operands in
-            #     many synthesis flows; for proof-of-concept this is acceptable.
+            # (c) Approximate reciprocal of sum via LUT.
+            #     After ReLU the scores are non-negative, so the sum
+            #     ranges from 0 to seq_len * max_positive (where
+            #     max_positive = (1 << (bits-1)) - 1).
+            #     For each possible sum value s we precompute
+            #         recip = round(scale_factor / s)
+            #     where scale_factor = one_fp << frac_shift, then
+            #     multiply and shift instead of dividing at runtime.
             recip_bits = norm_bits + frac_shift
             recip_wire = f"{rpfx}_recip"
             numer = (one_fp << frac_shift)
+
+            max_relu_val = (1 << (bits - 1)) - 1
+            max_sum_val = seq_len * max_relu_val
+            # sum_wire is signed norm_bits wide; after ReLU the actual
+            # values are non-negative so we use the unsigned magnitude.
+            sum_ubits = max(1, max_sum_val.bit_length())
+
+            # Cap reciprocal LUT at 4096 entries to keep synthesis
+            # tractable.  For sums beyond the LUT range we reuse the
+            # last entry -- the reciprocal is monotonically decreasing
+            # so this is a safe (slightly over-weighted) approximation.
+            lut_max = min(max_sum_val, 4096)
+
+            lines.append(f"    reg signed [{recip_bits - 1}:0] {recip_wire};")
+            lines.append(f"    always @(*) begin")
+            lines.append(f"        case ({sum_wire}[{sum_ubits - 1}:0])")
+            for s in range(1, lut_max + 1):
+                rv = int(round(numer / s))
+                rv = min(rv, (1 << (recip_bits - 1)) - 1)  # stay in signed range
+                lines.append(
+                    f"            {sum_ubits}'d{s}: {recip_wire} = "
+                    f"{emit.slit(recip_bits, rv)};"
+                )
+            # For sums > lut_max, use the last LUT entry's value as default
+            if max_sum_val > 4096:
+                default_rv = int(round(numer / lut_max))
+                default_rv = min(default_rv, (1 << (recip_bits - 1)) - 1)
+            else:
+                default_rv = 0
             lines.append(
-                f"    wire signed [{recip_bits - 1}:0] {recip_wire} = "
-                f"({sum_wire} == {norm_bits}'sd0) "
-                f"? {recip_bits}'sd0 "
-                f": ({emit.slit(recip_bits, numer)} / "
-                f"{{{{{recip_bits - norm_bits}{{{sum_wire}[{norm_bits - 1}]}}}}, {sum_wire}}});"
+                f"            default: {recip_wire} = {emit.slit(recip_bits, default_rv)};"
             )
+            lines.append(f"        endcase")
+            lines.append(f"    end")
             lines.append("")
 
             # (d) Multiply each ReLU'd score by reciprocal, shift back.

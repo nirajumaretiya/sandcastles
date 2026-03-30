@@ -297,8 +297,12 @@ def _extract_weights_matmul(node, inits: Dict[str, np.ndarray]) -> Dict[str, np.
     weights: Dict[str, np.ndarray] = {}
     # Either input could be the weight matrix.
     if node.input[1] in inits:
-        weights["weight"] = inits[node.input[1]]
+        # ONNX MatMul: A @ B where B is (n_in, n_out).
+        # Dense generator expects (n_out, n_in), so transpose.
+        weights["weight"] = inits[node.input[1]].T
     elif node.input[0] in inits:
+        # Weight is the first operand (B @ activation) — already in
+        # (n_out, n_in) orientation, no transpose needed.
         weights["weight"] = inits[node.input[0]]
     return weights
 

@@ -283,8 +283,11 @@ def forward_op_float(
         x = tensor_values[op.inputs[0]]
         if x.ndim <= 1:
             return {out_name: x}
-        # Preserve batch dimension (dim 0), flatten the rest
-        return {out_name: x.reshape(x.shape[0], -1) if x.ndim > 2 else x}
+        # Flatten all dims except the first (batch dim for calibration).
+        # Verilog generate_flatten does a full 1D rewire on single samples;
+        # here we preserve dim-0 so batched calibration data flows through
+        # downstream Dense layers correctly.
+        return {out_name: x.reshape(x.shape[0], -1)}
 
     if otype == OpType.CONCAT:
         arrays = [tensor_values[n] for n in op.inputs]
@@ -294,6 +297,24 @@ def forward_op_float(
     # ---- multi-head attention ---------------------------------------------
     if otype == OpType.MULTI_HEAD_ATTENTION:
         return {out_name: _mha_float(op, tensor_values)}
+
+    # ---- swiglu -------------------------------------------------------------
+    if otype == OpType.SWIGLU:
+        return {out_name: _swiglu_float(op, tensor_values)}
+
+    # ---- rope ---------------------------------------------------------------
+    if otype == OpType.ROPE:
+        return {out_name: _rope_float(op, tensor_values)}
+
+    # ---- grouped query attention --------------------------------------------
+    if otype == OpType.GROUPED_QUERY_ATTENTION:
+        return {out_name: _gqa_float(op, tensor_values)}
+
+    # ---- kv cache -----------------------------------------------------------
+    if otype == OpType.KV_CACHE:
+        # Pass-through for calibration: output = input
+        x = tensor_values[op.inputs[0]]
+        return {out_name: x.copy()}
 
     raise ValueError(f"forward_op_float: unsupported op type {otype}")
 
@@ -528,6 +549,179 @@ def _mha_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+#  SwiGLU (float)
+# ---------------------------------------------------------------------------
+
+def _swiglu_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    SwiGLU forward pass:
+        gate = x @ gate_W.T + gate_b
+        up   = x @ up_W.T + up_b
+        hidden = silu(gate) * up
+        out  = hidden @ down_W.T + down_b
+    """
+    x = tv[op.inputs[0]]
+
+    gate_w = op.weights['gate_weight']    # (ffn_dim, dim)
+    up_w   = op.weights['up_weight']      # (ffn_dim, dim)
+    down_w = op.weights['down_weight']    # (dim, ffn_dim)
+
+    gate_b = op.weights.get('gate_bias')
+    up_b   = op.weights.get('up_bias')
+    down_b = op.weights.get('down_bias')
+
+    gate = x @ gate_w.T
+    if gate_b is not None:
+        gate = gate + gate_b
+
+    up = x @ up_w.T
+    if up_b is not None:
+        up = up + up_b
+
+    # SiLU activation on gate: silu(x) = x * sigmoid(x)
+    sig = 1.0 / (1.0 + np.exp(-gate))
+    hidden = (gate * sig) * up
+
+    out = hidden @ down_w.T
+    if down_b is not None:
+        out = out + down_b
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  RoPE (float)
+# ---------------------------------------------------------------------------
+
+def _rope_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Rotary position embeddings forward pass.
+
+    Input: (seq_len, embed_dim) or (embed_dim,).
+    cos_table: (max_seq_len, half_dim)
+    sin_table: (max_seq_len, half_dim)
+
+    For each position pos, for each pair (d, d+half):
+        out[d]      = x[d]*cos[pos,d] - x[d+half]*sin[pos,d]
+        out[d+half] = x[d]*sin[pos,d] + x[d+half]*cos[pos,d]
+    """
+    x = tv[op.inputs[0]]
+
+    cos_table = op.weights['cos_table']   # (max_seq_len, half)
+    sin_table = op.weights['sin_table']   # (max_seq_len, half)
+
+    dim = op.attrs['dim']
+    half = dim // 2
+
+    if x.ndim == 1:
+        # Single position — treat as position 0
+        out = np.zeros_like(x)
+        cos_vals = cos_table[0, :half]
+        sin_vals = sin_table[0, :half]
+        out[:half]    = x[:half] * cos_vals - x[half:] * sin_vals
+        out[half:]    = x[:half] * sin_vals + x[half:] * cos_vals
+    else:
+        # (seq_len, dim) — apply per-position
+        seq_len = x.shape[0]
+        out = np.zeros_like(x)
+        for pos in range(seq_len):
+            cos_vals = cos_table[pos, :half]
+            sin_vals = sin_table[pos, :half]
+            out[pos, :half]    = x[pos, :half] * cos_vals - x[pos, half:] * sin_vals
+            out[pos, half:]    = x[pos, :half] * sin_vals + x[pos, half:] * cos_vals
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  GQA (float)
+# ---------------------------------------------------------------------------
+
+def _gqa_float(op: Operation, tv: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Grouped-query attention forward pass.
+
+    Same as MHA but K/V have fewer heads (num_kv_heads < num_heads).
+    Each KV head is shared by (num_heads // num_kv_heads) query heads.
+    """
+    x = tv[op.inputs[0]]
+
+    num_heads    = op.attrs['num_heads']
+    num_kv_heads = op.attrs['num_kv_heads']
+    head_dim     = op.attrs['head_dim']
+    embed_dim    = op.attrs.get('embed_dim', num_heads * head_dim)
+
+    Wq = op.weights['q_weight']       # (embed_dim, embed_dim)
+    bq = op.weights.get('q_bias')
+    Wk = op.weights['k_weight']       # (kv_dim, embed_dim)
+    bk = op.weights.get('k_bias')
+    Wv = op.weights['v_weight']       # (kv_dim, embed_dim)
+    bv = op.weights.get('v_bias')
+    Wo = op.weights['out_weight']     # (embed_dim, embed_dim)
+    bo = op.weights.get('out_bias')
+
+    kv_dim = num_kv_heads * head_dim
+    heads_per_group = num_heads // num_kv_heads
+
+    # Linear projections
+    Q = x @ Wq.T
+    K = x @ Wk.T
+    V = x @ Wv.T
+    if bq is not None:
+        Q = Q + bq
+    if bk is not None:
+        K = K + bk
+    if bv is not None:
+        V = V + bv
+
+    # Determine batch/sequence dims
+    orig_shape = Q.shape
+    if Q.ndim == 2:
+        seq_len = orig_shape[0]
+        Q = Q.reshape(1, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(1, seq_len, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(1, seq_len, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+    elif Q.ndim == 3:
+        B, seq_len, _ = orig_shape
+        Q = Q.reshape(B, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(B, seq_len, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(B, seq_len, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+    else:
+        raise ValueError(f"GQA: unexpected input ndim {Q.ndim}")
+
+    # Expand K/V heads to match Q heads via repeat
+    # K shape: (B, num_kv_heads, S, head_dim)
+    # -> repeat each KV head heads_per_group times along head axis
+    K = np.repeat(K, heads_per_group, axis=1)  # (B, num_heads, S, head_dim)
+    V = np.repeat(V, heads_per_group, axis=1)
+
+    # Scaled dot-product attention
+    scale = math.sqrt(head_dim)
+    scores = np.matmul(Q, K.transpose(0, 1, 3, 2)) / scale
+    scores_max = np.max(scores, axis=-1, keepdims=True)
+    e = np.exp(scores - scores_max)
+    attn = e / np.sum(e, axis=-1, keepdims=True)
+
+    ctx = np.matmul(attn, V)  # (B, num_heads, S, head_dim)
+
+    # Concat heads
+    if orig_shape[-1] == embed_dim and len(orig_shape) == 2:
+        ctx = ctx.transpose(0, 2, 1, 3).reshape(1, seq_len, embed_dim)
+        ctx = ctx[0]
+    else:
+        B = ctx.shape[0]
+        seq_len = ctx.shape[2]
+        ctx = ctx.transpose(0, 2, 1, 3).reshape(B, seq_len, embed_dim)
+
+    # Output projection
+    out = ctx @ Wo.T
+    if bo is not None:
+        out = out + bo
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 #  Quantize tensor
 # ---------------------------------------------------------------------------
 
@@ -688,6 +882,10 @@ _WEIGHTED_OPS = {
     OpType.RMSNORM,
     OpType.BATCHNORM,
     OpType.MULTI_HEAD_ATTENTION,
+    OpType.GROUPED_QUERY_ATTENTION,
+    OpType.SWIGLU,
+    OpType.ROPE,
+    OpType.KV_CACHE,
     OpType.EMBEDDING,
 }
 
@@ -723,6 +921,19 @@ def _quantize_op(
 
     elif op.op_type == OpType.MULTI_HEAD_ATTENTION:
         _compute_mha_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type == OpType.GROUPED_QUERY_ATTENTION:
+        _compute_gqa_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type == OpType.SWIGLU:
+        _compute_swiglu_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type == OpType.ROPE:
+        _compute_rope_requant(op, tensor_scales, bits, scheme, granularity)
+
+    elif op.op_type == OpType.KV_CACHE:
+        # No weights to quantize — pass through
+        pass
 
     elif op.op_type in (OpType.LAYERNORM, OpType.RMSNORM, OpType.BATCHNORM):
         _compute_norm_requant(op, tensor_scales, bits, scheme, granularity)
@@ -821,7 +1032,15 @@ def _compute_mha_requant(
     scheme: QuantScheme,
     granularity: QuantGranularity,
 ) -> None:
-    """Compute requantization params for multi-head attention."""
+    """Compute per-projection requantization params for multi-head attention.
+
+    The Verilog generator (attention.py) expects per-projection keys:
+        q_requant_mult, q_requant_shift,
+        k_requant_mult, k_requant_shift,
+        v_requant_mult, v_requant_shift,
+        out_requant_mult, out_requant_shift,
+        acc_bits.
+    """
     input_name = op.inputs[0]
     output_name = op.outputs[0]
     input_scale = tensor_scales.get(input_name, 1.0)
@@ -846,20 +1065,23 @@ def _compute_mha_requant(
             op.q_weights[pname] = q_arr
             w_scale_map[pname] = float(ws[0]) if ws.size == 1 else ws
 
-    # Use the output projection scale for the final requantization
-    out_ws = w_scale_map.get('out_weight', 1.0)
-    if isinstance(out_ws, np.ndarray):
-        out_ws = float(out_ws[0])
-    m, s = compute_requant(input_scale, out_ws, output_scale)
-
+    # Per-projection requantization: each projection (q, k, v, out) gets
+    # its own requant_mult/shift, computed from its weight scale.
     op.q_params = {
-        'requant_mult': m,
-        'requant_shift': s,
         'input_scale': float(input_scale),
         'weight_scale': w_scale_map,
         'output_scale': float(output_scale),
         'acc_bits': a_bits,
     }
+
+    for proj in ('q', 'k', 'v', 'out'):
+        wkey = f'{proj}_weight'
+        ws = w_scale_map.get(wkey, 1.0)
+        if isinstance(ws, np.ndarray):
+            ws = float(ws[0])
+        m, s = compute_requant(input_scale, float(ws), output_scale)
+        op.q_params[f'{proj}_requant_mult'] = m
+        op.q_params[f'{proj}_requant_shift'] = s
 
 
 def _compute_norm_requant(
@@ -929,4 +1151,166 @@ def _compute_embedding_requant(
         'weight_scale': ws_float,
         'output_scale': float(output_scale),
         'acc_bits': bits,
+    }
+
+
+def _compute_swiglu_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute per-projection requantization params for SwiGLU.
+
+    The Verilog generator (transformer.py) expects:
+        gate_requant_mult, gate_requant_shift,
+        up_requant_mult,   up_requant_shift,
+        down_requant_mult, down_requant_shift,
+        acc_bits.
+    """
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    input_scale = tensor_scales.get(input_name, 1.0)
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    # Quantize all weight tensors
+    weight_names = [
+        'gate_weight', 'up_weight', 'down_weight',
+        'gate_bias', 'up_bias', 'down_bias',
+    ]
+    w_scale_map = {}
+    for wname in weight_names:
+        if wname in op.weights:
+            warr = op.weights[wname]
+            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
+            op.q_weights[wname] = q_arr
+            w_scale_map[wname] = float(ws[0]) if ws.size == 1 else ws
+
+    # Accumulator bits — use the largest weight dimension
+    gate_w = op.weights['gate_weight']         # (ffn_dim, dim)
+    down_w = op.weights['down_weight']         # (dim, ffn_dim)
+    n_in = max(gate_w.shape[1], down_w.shape[1])
+    a_bits = acc_bits_for(n_in, bits)
+
+    op.q_params = {
+        'input_scale': float(input_scale),
+        'weight_scale': w_scale_map,
+        'output_scale': float(output_scale),
+        'acc_bits': a_bits,
+    }
+
+    # Per-projection requant: gate, up, down
+    for proj in ('gate', 'up', 'down'):
+        wkey = f'{proj}_weight'
+        ws = w_scale_map.get(wkey, 1.0)
+        if isinstance(ws, np.ndarray):
+            ws = float(ws[0])
+        m, s = compute_requant(input_scale, float(ws), output_scale)
+        op.q_params[f'{proj}_requant_mult'] = m
+        op.q_params[f'{proj}_requant_shift'] = s
+
+
+def _compute_gqa_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute per-projection requantization params for grouped-query attention.
+
+    The Verilog generator (transformer.py) expects:
+        q_requant_mult, q_requant_shift,
+        k_requant_mult, k_requant_shift,
+        v_requant_mult, v_requant_shift,
+        out_requant_mult, out_requant_shift,
+        acc_bits.
+    """
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    input_scale = tensor_scales.get(input_name, 1.0)
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    embed_dim = op.attrs.get(
+        'embed_dim',
+        op.attrs['num_heads'] * op.attrs['head_dim'],
+    )
+    a_bits = acc_bits_for(embed_dim, bits)
+
+    # Quantize all weight matrices
+    proj_names = [
+        'q_weight', 'k_weight', 'v_weight', 'out_weight',
+        'q_bias', 'k_bias', 'v_bias', 'out_bias',
+    ]
+    w_scale_map = {}
+    for pname in proj_names:
+        if pname in op.weights:
+            warr = op.weights[pname]
+            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
+            op.q_weights[pname] = q_arr
+            w_scale_map[pname] = float(ws[0]) if ws.size == 1 else ws
+
+    op.q_params = {
+        'input_scale': float(input_scale),
+        'weight_scale': w_scale_map,
+        'output_scale': float(output_scale),
+        'acc_bits': a_bits,
+    }
+
+    # Per-projection requant: q, k, v, out
+    for proj in ('q', 'k', 'v', 'out'):
+        wkey = f'{proj}_weight'
+        ws = w_scale_map.get(wkey, 1.0)
+        if isinstance(ws, np.ndarray):
+            ws = float(ws[0])
+        m, s = compute_requant(input_scale, float(ws), output_scale)
+        op.q_params[f'{proj}_requant_mult'] = m
+        op.q_params[f'{proj}_requant_shift'] = s
+
+
+def _compute_rope_requant(
+    op: Operation,
+    tensor_scales: Dict[str, float],
+    bits: int,
+    scheme: QuantScheme,
+    granularity: QuantGranularity,
+) -> None:
+    """Compute requantization params for rotary position embeddings.
+
+    The cos/sin tables are lookup tables that get quantized.  The
+    rotation itself is a 2-term MAC per output element, so we
+    provide a generic requant_mult/shift pair plus acc_bits.
+    """
+    input_name = op.inputs[0]
+    output_name = op.outputs[0]
+    input_scale = tensor_scales.get(input_name, 1.0)
+    output_scale = tensor_scales.get(output_name, 1.0)
+
+    # Quantize cos and sin tables (lookup tables, per-tensor is fine)
+    for tname in ('cos_table', 'sin_table'):
+        if tname in op.weights:
+            warr = op.weights[tname]
+            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
+            op.q_weights[tname] = q_arr
+
+    # The rotation MAC has 2 multiply-add terms per output element.
+    # Input is multiplied by a cos/sin table value (both quantised to
+    # `bits`), so the effective "weight scale" is the table's scale.
+    cos_table = op.weights['cos_table']
+    _, cos_ws = quantize_tensor(cos_table, bits, scheme, granularity, axis=0)
+    table_scale = float(cos_ws[0]) if cos_ws.size == 1 else float(np.mean(cos_ws))
+
+    # acc_bits: 2 terms (the rotation sum has exactly 2 products)
+    a_bits = acc_bits_for(2, bits)
+
+    m, s = compute_requant(input_scale, table_scale, output_scale)
+
+    op.q_params = {
+        'requant_mult': m,
+        'requant_shift': s,
+        'input_scale': float(input_scale),
+        'weight_scale': table_scale,
+        'output_scale': float(output_scale),
+        'acc_bits': a_bits,
     }

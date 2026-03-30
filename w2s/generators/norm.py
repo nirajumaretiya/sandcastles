@@ -262,9 +262,14 @@ def generate_layernorm(
     for i in range(D):
         sq = f"{p}_sq_{i}"
         sq_names.append(sq)
+        sq_full = f"{p}_sqfull_{i}"
+        lines.append(
+            f"    wire signed [63:0] {sq_full} = "
+            f"{diff_names[i]} * {diff_names[i]};"
+        )
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {sq} = "
-            f"({diff_names[i]} * {diff_names[i]}) >>> {bits};"
+            f"{sq_full} >>> {bits};"
             f"  // keep in range"
         )
     lines.append("")
@@ -399,9 +404,14 @@ def generate_rmsnorm(
     for i in range(D):
         sq = f"{p}_sq_{i}"
         sq_names.append(sq)
+        sq_full = f"{p}_sqfull_{i}"
+        lines.append(
+            f"    wire signed [63:0] {sq_full} = "
+            f"{se_names[i]} * {se_names[i]};"
+        )
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {sq} = "
-            f"({se_names[i]} * {se_names[i]}) >>> {bits};"
+            f"{sq_full} >>> {bits};"
             f"  // x^2 scaled"
         )
     lines.append("")
@@ -508,7 +518,15 @@ def generate_batchnorm(
 
     This yields simple per-element multiply-add with hardwired constants.
     """
-    # -- Float weights for folding --
+    # -- Use pre-quantized weights from the main quantization pipeline --
+    # The quantizer stores quantized scale (gamma) and bias (beta) in
+    # op.q_weights, and skips running_mean / running_var.  We fold the
+    # BN into a per-channel affine using the quantized scale/bias and
+    # the float running stats (which are exact constants, not learned).
+    scale_q = op.q_weights['scale']                # (C,) int — quantized gamma
+    bias_q = op.q_weights['bias']                  # (C,) int — quantized beta
+
+    # Float originals for folding factors and comments
     scale_f = op.weights['scale']                  # (C,)
     bias_f = op.weights['bias']                    # (C,)
     running_mean_f = op.weights['running_mean']    # (C,)
@@ -519,22 +537,31 @@ def generate_batchnorm(
     in_tensor = wire_map[op.inputs[0]]
     out_tensor_name = op.outputs[0]
 
-    # -- Pre-compute folded weights at compile time --
-    bn_weight_f = scale_f / np.sqrt(running_var_f + eps)
-    bn_bias_f = bias_f - scale_f * running_mean_f / np.sqrt(running_var_f + eps)
+    # -- Fold BN into per-channel affine using quantized scale/bias --
+    # At inference: y[c] = (scale/sqrt(var+eps)) * x[c]
+    #                    + (bias - scale*mean/sqrt(var+eps))
+    # The quantizer already mapped scale -> scale_q and bias -> bias_q
+    # using the global quantization scale.  We apply the folding factors
+    # (1/sqrt(var+eps) and -mean/sqrt(var+eps)) in float and round, so
+    # the result stays on the same quantization grid.
+    inv_std = 1.0 / np.sqrt(running_var_f + eps)
 
-    # Quantize the folded constants to the working bit width.
-    # Scale into the integer range matching the activation quantization.
-    qmax = (1 << (bits - 1)) - 1
-    w_abs_max = max(np.max(np.abs(bn_weight_f)), 1e-12)
-    b_abs_max = max(np.max(np.abs(bn_bias_f)), 1e-12)
-
+    # bn_weight_q[c] = round(scale_q[c] * inv_std[c])
     bn_weight_q = np.clip(
-        np.round(bn_weight_f / w_abs_max * qmax), -qmax, qmax
+        np.round(scale_q.astype(np.float64) * inv_std),
+        -(1 << (bits - 1)), (1 << (bits - 1)) - 1,
     ).astype(np.int64)
+
+    # bn_bias_q[c] = bias_q[c] - round(scale_q[c] * mean[c] * inv_std[c])
     bn_bias_q = np.clip(
-        np.round(bn_bias_f / b_abs_max * qmax), -qmax, qmax
+        np.round(bias_q.astype(np.float64)
+                 - scale_q.astype(np.float64) * running_mean_f * inv_std),
+        -(1 << (bits - 1)), (1 << (bits - 1)) - 1,
     ).astype(np.int64)
+
+    # Float folded weights for Verilog comments
+    bn_weight_f = scale_f * inv_std
+    bn_bias_f = bias_f - scale_f * running_mean_f * inv_std
 
     lines: List[str] = []
     p = op.name

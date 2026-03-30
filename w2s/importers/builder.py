@@ -341,6 +341,7 @@ class GraphBuilder:
         out_weight: np.ndarray,
         out_bias: np.ndarray,
         num_heads: int,
+        seq_len: int = 1,
         name: str = None,
     ) -> str:
         op_name = self._auto_name("mha", name)
@@ -355,6 +356,7 @@ class GraphBuilder:
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "embed_dim": embed_dim,
+                "seq_len": seq_len,
             },
             weights={
                 "q_weight": qw,

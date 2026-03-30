@@ -430,9 +430,12 @@ def _estimate_sequential(
     mac_luts = _SEQ_LUTS_MULTIPLIER + _SEQ_LUTS_ACCUMULATOR + _SEQ_LUTS_REQUANT
     control_luts = _SEQ_LUTS_CONTROL
 
-    # Weight ROM: case statement in LUT fabric
-    # ~1 LUT per bit stored (Yosys maps case to LUT tree)
-    rom_luts = rom_bits  # 1 LUT per bit
+    # Weight ROM: case statement in LUT fabric.
+    # A LUT6 can encode ~5 bits of ROM on average (Yosys synthesis of
+    # case-statement ROMs packs multiple address bits per LUT).
+    # The old 1:1 ratio was ~5x too pessimistic.
+    _ROM_BITS_PER_LUT = 5  # typical for Yosys synthesis of case-statement ROM
+    rom_luts = rom_bits // _ROM_BITS_PER_LUT
 
     # Activation buffers: need to hold the largest intermediate tensor
     # between layers so we can feed it to the next layer

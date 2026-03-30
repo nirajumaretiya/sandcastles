@@ -13,7 +13,7 @@ import os
 import numpy as np
 from pathlib import Path
 
-__version__ = "0.2.0"
+from w2s import __version__
 
 BANNER = "weights2silicon (w2s) — Compile neural networks to hardwired Verilog"
 
@@ -176,6 +176,24 @@ def cmd_estimate(args):
     graph = _load_model(args.model)
     total_params = _count_params(graph)
 
+    # Quantize the graph so the estimator has accurate weight information
+    from w2s.core import QuantConfig, QuantScheme, QuantGranularity
+    config = QuantConfig(
+        bits=args.bits,
+        scheme=QuantScheme.SYMMETRIC,
+        granularity=QuantGranularity.PER_TENSOR,
+    )
+    graph.quant_config = config
+
+    calib_data = {}
+    for inp_name in graph.input_names:
+        shape = graph.input_shapes.get(inp_name, (1,))
+        calib_shape = (4,) + tuple(shape)
+        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+
+    from w2s.quantize import quantize_graph
+    graph = quantize_graph(graph, calib_data, config)
+
     modes = [args.mode] if args.mode != "both" else ["combinational", "sequential"]
 
     # Try the estimate module (may not exist yet)
@@ -188,7 +206,7 @@ def cmd_estimate(args):
     if has_estimator:
         for mode in modes:
             print(f"\n--- {mode} ---")
-            report = run_estimate(graph, mode=mode, bits=args.bits)
+            report = run_estimate(graph, mode=mode)
             print(report)
     else:
         # Fallback: print basic parameter counts
@@ -278,6 +296,12 @@ def build_parser():
     )
     parser.add_argument(
         "--version", action="version", version=f"w2s {__version__}",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Print full tracebacks on error",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -374,7 +398,11 @@ def main():
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        else:
+            print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 

@@ -18,10 +18,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-from w2s import (
-    DenseLayer, quantize, forward_int, forward_float,
-    generate_verilog, generate_testbench, summarize,
-)
+from w2s.core import QuantConfig
+from w2s.importers.builder import GraphBuilder
+from w2s.quantize import quantize_graph
+from w2s.graph import compile_graph, forward_int, summarize
 
 
 # ---------------------------------------------------------------------------
@@ -94,55 +94,47 @@ def main():
     W1, b1, W2, b2, X, y = train_xor()
     print()
 
-    # Define the network for w2s
-    # Note: for the hardwired chip, we use the pre-sigmoid linear output.
-    # Positive output -> 1, non-positive -> 0.
-    layers = [
-        DenseLayer(weights=W1, biases=b1, activation="relu"),
-        DenseLayer(weights=W2, biases=b2, activation="none"),
-    ]
-
-    # Float forward pass for reference
-    float_out = forward_float(layers, X)
-    print("Float outputs (pre-sigmoid):")
-    for i, (inp, out) in enumerate(zip(X, float_out)):
-        label = int(out[0] > 0)
-        print(f"  {inp} -> {out[0]:+.4f}  (class: {label})")
-    print()
+    # Build compute graph using the modern API
+    gb = GraphBuilder("xor_nn")
+    inp = gb.input("x", shape=(2,))
+    h = gb.dense(inp, W1, b1, activation="relu", name="hidden")
+    out = gb.dense(h, W2, b2, name="output")
+    gb.output(out)
+    graph = gb.build()
 
     # Quantize
-    qnet = quantize("xor_nn", layers, calibration_data=X, bits=8)
-    print(summarize(qnet))
-    print()
+    graph.quant_config = QuantConfig(bits=8)
+    quantize_graph(graph, {"x": X})
 
-    # Integer forward pass (this is what the Verilog computes)
-    int_out = forward_int(qnet, X)
-    if int_out.ndim == 1:
-        int_out = int_out.reshape(-1, 1)
-    print("Quantized integer outputs (matches Verilog exactly):")
-    for i, (inp, out) in enumerate(zip(X, int_out)):
-        label = int(out[0] > 0)
-        target = int(y[i][0])
-        status = "OK" if label == target else "WRONG"
-        print(f"  {inp} -> {out[0]:+4d}  (class: {label})  [{status}]")
-    print()
-
-    # Check correctness
-    int_preds = (int_out[:, 0] > 0).astype(int)
-    target_preds = y.flatten().astype(int)
-    if np.array_equal(int_preds, target_preds):
-        print("Quantized model classifies all XOR inputs correctly!")
-    else:
-        print("WARNING: Quantization degraded accuracy (try more training epochs)")
+    print(summarize(graph))
     print()
 
     # Generate Verilog
     output_dir = str(Path(__file__).resolve().parent.parent / "output")
-    v_path = generate_verilog(qnet, output_dir)
-    tb_path = generate_testbench(qnet, X, output_dir)
+    v_path = compile_graph(graph, output_dir)
+    print(f"Generated Verilog: {v_path}")
+    print()
 
-    print(f"Generated Verilog   : {v_path}")
-    print(f"Generated testbench : {tb_path}")
+    # Integer forward pass (this is what the Verilog computes)
+    print("Quantized integer outputs (matches Verilog exactly):")
+    all_ok = True
+    for i in range(len(X)):
+        result = forward_int(graph, {"x": X[i:i+1]})
+        out_name = graph.output_names[0]
+        val = result[out_name].flatten()[0] if out_name in result else 0
+        label = int(val > 0) if isinstance(val, (int, np.integer)) else 0
+        target = int(y[i][0])
+        status = "OK" if label == target else "WRONG"
+        if label != target:
+            all_ok = False
+        print(f"  {X[i]} -> {val:+4}  (class: {label})  [{status}]")
+    print()
+
+    # Check correctness
+    if all_ok:
+        print("Quantized model classifies all XOR inputs correctly!")
+    else:
+        print("WARNING: Quantization degraded accuracy (try more training epochs)")
     print()
 
     # Show a snippet of the generated Verilog

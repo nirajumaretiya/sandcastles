@@ -15,6 +15,7 @@ The weights are still the silicon — they're constants in the ROM.
 The compute is sequential. The area is minimal.
 """
 
+import copy
 import math
 import numpy as np
 from pathlib import Path
@@ -30,6 +31,8 @@ from w2s import emit
 
 def _fuse_ops(ops: List[Operation]) -> List[Operation]:
     """Fuse activation ops into preceding weighted ops where possible."""
+    # Deep-copy so we don't mutate the caller's original Operation objects
+    ops = [copy.deepcopy(op) for op in ops]
     fused = []
     skip_next = False
     for i, op in enumerate(ops):
@@ -244,12 +247,23 @@ def compile_sequential(
     states['DONE_ST'] = idx
 
     # Collect requant params
+    # Note: sequential mode uses a single MAC, so per-channel requant arrays
+    # are reduced to a single value (mean). This is an approximation; true
+    # per-channel requant would require a per-output-neuron lookup table.
     requant_mults = []
     requant_shifts = []
     activations = []
     for layer in layers:
-        requant_mults.append(int(layer.q_params.get('requant_mult', 1)))
-        requant_shifts.append(int(layer.q_params.get('requant_shift', 16)))
+        rm = layer.q_params.get('requant_mult', 1)
+        if isinstance(rm, np.ndarray):
+            rm = int(rm.mean())
+        requant_mults.append(int(rm))
+
+        rs = layer.q_params.get('requant_shift', 16)
+        if isinstance(rs, np.ndarray):
+            rs = int(rs.mean())
+        requant_shifts.append(int(rs))
+
         activations.append(layer.attrs.get('activation', 'none'))
 
     # Use common shift if possible
@@ -437,7 +451,7 @@ def compile_sequential(
     e(f"                            out_neuron <= 0;")
     e(f"                            in_idx     <= 0;")
     e(f"                            l0_waddr   <= 0;")
-    e(f"                            mac_acc    <= l0_bdata;")
+    e(f"                            mac_acc    <= l0_b(0);  // explicit index: out_neuron not yet 0")
     e(f"                            req_mult   <= 32'sd{requant_mults[0]};")
     if shift_val is None:
         e(f"                            req_shift  <= 6'd{requant_shifts[0]};")
@@ -496,7 +510,7 @@ def compile_sequential(
             e(f"                        out_neuron <= 0;")
             e(f"                        in_idx     <= 0;")
             e(f"                        l{li + 1}_waddr <= 0;")
-            e(f"                        mac_acc    <= l{li + 1}_bdata;")
+            e(f"                        mac_acc    <= l{li + 1}_b(0);  // explicit index: out_neuron not yet 0")
             e(f"                        req_mult   <= 32'sd{requant_mults[li + 1]};")
             if shift_val is None:
                 e(f"                        req_shift  <= 6'd{requant_shifts[li + 1]};")
@@ -505,10 +519,21 @@ def compile_sequential(
         # Common: next neuron in same layer
         e(f"                        out_neuron <= out_neuron + 1;")
         e(f"                        in_idx     <= 0;")
-        waddr_expr = f"(out_neuron + 1) * {max_idx_bits}'d{n_in_l}"
+        # Use the weight-address register width for the constant literal
+        # so that n_in_l is not truncated when it exceeds 2^max_idx_bits.
+        # Also zero-extend out_neuron to waddr_bits so the multiplication
+        # is performed at sufficient width and does not overflow.
+        total_w_l = n_in_l * n_out_l
+        waddr_bits_l = max(math.ceil(math.log2(max(total_w_l, 2))), 1)
+        pad = waddr_bits_l - max_idx_bits
+        if pad > 0:
+            neuron_ext = f"{{{{{pad}'b0, out_neuron}}}}"
+        else:
+            neuron_ext = "out_neuron"
+        waddr_expr = f"({neuron_ext} + {waddr_bits_l}'d1) * {waddr_bits_l}'d{n_in_l}"
         e(f"                        l{li}_waddr <= {waddr_expr};")
-        # Bias for next neuron: the ROM reads from out_neuron, which will
-        # update next cycle, so the bias will be correct on the MAC cycle
+        # Bias for next neuron: out_neuron + 1 is safe here because
+        # this else-branch only runs when out_neuron < n_out_l - 1
         e(f"                        mac_acc    <= l{li}_b(out_neuron[{aw(n_out_l) - 1}:0] + 1);")
         e(f"                        state      <= L{li}_MAC;")
         e(f"                    end")
@@ -531,9 +556,10 @@ def compile_sequential(
 
     # DONE
     e(f"                DONE_ST: begin")
-    e(f"                    out_valid <= 1'b0;")
-    e(f"                    done      <= 1'b1;")
-    e(f"                    state     <= IDLE;")
+    e(f"                    out_valid  <= 1'b0;")
+    e(f"                    done       <= 1'b1;")
+    e(f"                    out_neuron <= 0;  // reset for next inference")
+    e(f"                    state      <= IDLE;")
     e(f"                end")
     e()
     e(f"            endcase")

@@ -4,11 +4,13 @@ weights2silicon (w2s) — Compile neural network weights to hardwired Verilog.
 Public API
 ----------
     from w2s import ComputeGraph, Operation, OpType, QuantConfig
-    from w2s.quantize import quantize
+    from w2s.quantize import quantize_graph
     from w2s.graph import compile_graph
     from w2s.importers.builder import GraphBuilder
     from w2s.importers.onnx_import import load_onnx
 """
+
+__version__ = "0.2.0"
 
 from w2s.core import (
     OpType,

@@ -139,8 +139,10 @@ def _sigmoid_pwl_params(bits: int) -> Tuple[List[int], List[int], List[int]]:
     qmax = (1 << (bits - 1)) - 1    # 127 for 8-bit
     scale = 1.0 / (1 << (bits - 1)) # maps int -> roughly [-1,1]
 
-    # Breakpoints (7 boundaries -> 8 segments) in quantized int space
-    breakpoints = [-96, -64, -32, 0, 32, 64, 96]
+    # Breakpoints (7 boundaries -> 8 segments) in quantized int space,
+    # scaled relative to qmax so they work for any bit width (int4, int8, int16, etc.)
+    bp_fracs = [-0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75]
+    breakpoints = [int(frac * (qmax + 1)) for frac in bp_fracs]
 
     # Evaluate sigmoid at segment boundaries + endpoints
     edges = [qmin] + breakpoints + [qmax]
@@ -194,7 +196,9 @@ def _tanh_pwl_params(bits: int) -> Tuple[List[int], List[int], List[int]]:
     qmax = (1 << (bits - 1)) - 1
     scale = 1.0 / (1 << (bits - 1))
 
-    breakpoints = [-96, -64, -32, 0, 32, 64, 96]
+    # Scale breakpoints relative to qmax for any bit width
+    bp_fracs = [-0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75]
+    breakpoints = [int(frac * (qmax + 1)) for frac in bp_fracs]
     edges = [qmin] + breakpoints + [qmax]
 
     def tanh_q(x_int):
@@ -247,8 +251,11 @@ def _gelu_pwl_params(bits: int) -> Tuple[List[int], List[int], List[int]]:
     qmax = (1 << (bits - 1)) - 1
     scale = 1.0 / (1 << (bits - 1))
 
-    # 9 boundaries -> 10 segments, finer granularity in the transition region
-    breakpoints = [-112, -80, -48, -16, 0, 16, 48, 80, 112]
+    # 9 boundaries -> 10 segments, finer granularity in the transition region.
+    # Fractions are relative to 128 (the int8 half-range); scale to qmax+1.
+    gelu_bp_fracs = [-112/128, -80/128, -48/128, -16/128, 0,
+                     16/128, 48/128, 80/128, 112/128]
+    breakpoints = [int(frac * (qmax + 1)) for frac in gelu_bp_fracs]
     edges = [qmin] + breakpoints + [qmax]
 
     def gelu_float(x_f):
@@ -305,7 +312,9 @@ def _silu_pwl_params(bits: int) -> Tuple[List[int], List[int], List[int]]:
     qmax = (1 << (bits - 1)) - 1
     scale = 1.0 / (1 << (bits - 1))
 
-    breakpoints = [-96, -64, -32, 0, 32, 64, 96]
+    # Scale breakpoints relative to qmax for any bit width
+    bp_fracs = [-0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75]
+    breakpoints = [int(frac * (qmax + 1)) for frac in bp_fracs]
     edges = [qmin] + breakpoints + [qmax]
 
     def silu_q(x_int):
@@ -535,7 +544,11 @@ def generate_softmax(
     # Max possible sum is n * 255.  We build a case statement over
     # meaningful sum values (1 .. n*255).  Sum == 0 should not happen
     # in practice (at least one exp >= 1), mapped to 0.
-    max_sum = n * 255
+    # Cap max_sum to the largest value sum_wire can actually hold.
+    # sum_wire is sum_bits wide (unsigned), so its max is (1 << sum_bits) - 1.
+    # For large n the theoretical n*255 may exceed that.
+    qmax_exp = 255  # max unsigned 8-bit exp LUT output
+    max_sum = min(n * qmax_exp, (1 << sum_bits) - 1)
     recip_bits = 16  # enough for recip values up to 127*256 = 32512
 
     recip_reg = f"{prefix}_recip"
@@ -543,12 +556,29 @@ def generate_softmax(
     lines.append(f"    always @(*) begin")
     lines.append(f"        case ({sum_wire})")
 
-    for s in range(1, max_sum + 1):
+    # Cap the LUT at 4096 entries to prevent size explosion for large
+    # softmax dimensions.  For sum values beyond the LUT range, the default
+    # case returns the reciprocal of the largest tabled entry (i.e. the
+    # smallest reciprocal value in the table).  This is a safe
+    # approximation: large denominators produce near-zero probabilities
+    # anyway, so the rounding error is negligible.
+    _RECIP_LUT_CAP = 4096
+    lut_max = min(max_sum, _RECIP_LUT_CAP)
+
+    for s in range(1, lut_max + 1):
         rv = int(round(127.0 * 256.0 / s))
         rv = min(rv, (1 << recip_bits) - 1)
         lines.append(f"            {ulit(sum_bits, s)}: {recip_reg} = {ulit(recip_bits, rv)};")
 
-    lines.append(f"            default: {recip_reg} = {ulit(recip_bits, 0)};")
+    # default: for sum values beyond the LUT (> lut_max) use the
+    # reciprocal of the largest tabled entry; for the impossible sum==0
+    # case this also returns a safe small value.
+    if lut_max >= 1:
+        default_rv = int(round(127.0 * 256.0 / lut_max))
+        default_rv = min(default_rv, (1 << recip_bits) - 1)
+    else:
+        default_rv = 0
+    lines.append(f"            default: {recip_reg} = {ulit(recip_bits, default_rv)};")
     lines.append(f"        endcase")
     lines.append(f"    end")
 
@@ -561,6 +591,8 @@ def generate_softmax(
         shifted_w = f"{prefix}_psh_{i}"
         out_w = f"{prefix}_out_{i}"
 
+        clamped_w = f"{prefix}_clmp_{i}"
+
         lines.append(
             f"    wire [{mul_bits - 1}:0] {prod_w} = "
             f"{exp_wires[i]} * {recip_reg};"
@@ -568,11 +600,18 @@ def generate_softmax(
         lines.append(
             f"    wire [{mul_bits - 1}:0] {shifted_w} = {prod_w} >> 8;"
         )
-        # Saturate to signed [0, 127]
+        # Unsigned clamp to [0, clamp_max] before signed cast — avoids
+        # Verilog signed/unsigned mismatch on the direct assignment.
+        clamp_max = (1 << (bits - 1)) - 1
+        lines.append(
+            f"    wire [{bits - 1}:0] {clamped_w} = "
+            f"({shifted_w} > {ulit(mul_bits, clamp_max)}) ? {bits}'d{clamp_max} : "
+            f"{shifted_w}[{bits - 1}:0];"
+        )
+        # Safe cast: clamped value is in [0, clamp_max], fits in signed {bits}-bit
         lines.append(
             f"    wire signed [{bits - 1}:0] {out_w} = "
-            f"({shifted_w} > {ulit(mul_bits, 127)}) ? {slit(bits, 127)} : "
-            f"{shifted_w}[{bits - 1}:0];"
+            f"$signed({{1'b0, {clamped_w}[{bits - 2}:0]}});"
         )
         out_wires.append(out_w)
 

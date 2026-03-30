@@ -53,9 +53,10 @@ def generate_conv2d(
     sH, sW = op.attrs.get('stride', (1, 1))
     pH, pW = op.attrs.get('padding', (0, 0))
 
-    requant_mult = op.q_params['requant_mult']              # ndarray (Co,)
-    requant_shift = int(op.q_params['requant_shift'])
+    requant_mult = op.q_params['requant_mult']              # ndarray (Co,) or scalar
+    requant_shift = op.q_params['requant_shift']             # ndarray (Co,) or scalar
     acc_bits = int(op.q_params['acc_bits'])
+    per_channel = isinstance(requant_mult, np.ndarray)
 
     activation = op.attrs.get('activation', 'none')
 
@@ -79,6 +80,7 @@ def generate_conv2d(
     # header comment
     n_weights = C_out * C_in * kH * kW
     n_biases = C_out if bias is not None else 0
+    requant_shift_val = int(requant_shift)
     lines += section_comment(
         f"{op.name}: Conv2D  in({C_in},{H_in},{W_in}) "
         f"k({kH},{kW}) s({sH},{sW}) p({pH},{pW}) -> "
@@ -88,13 +90,14 @@ def generate_conv2d(
         f"    // {n_weights} weights + {n_biases} biases hardwired"
     )
     lines.append(
-        f"    // Requantize: per-channel mult, shift={requant_shift}"
+        f"    // Requantize: {'per-channel' if per_channel else 'per-tensor'} mult, shift={requant_shift_val}"
     )
     lines.append("")
 
     # ---- per-output-pixel generation -----------------------------------
     for co in range(C_out):
-        mult_co = int(requant_mult[co])
+        mult_co = int(requant_mult[co]) if per_channel else int(requant_mult)
+        shift_co = int(requant_shift)
 
         for oh in range(H_out):
             for ow in range(W_out):
@@ -191,7 +194,7 @@ def generate_conv2d(
 
                 # 3) requantize (per-channel)
                 rq_lines, shifted = requantize_lines(
-                    acc_name, acc_bits, mult_co, requant_shift, prefix
+                    acc_name, acc_bits, mult_co, shift_co, prefix
                 )
                 lines += rq_lines
 
@@ -244,9 +247,10 @@ def generate_conv1d(
     if isinstance(pW, (tuple, list)):
         pW = pW[0]
 
-    requant_mult = op.q_params['requant_mult']              # ndarray (Co,)
-    requant_shift = int(op.q_params['requant_shift'])
+    requant_mult = op.q_params['requant_mult']              # ndarray (Co,) or scalar
+    requant_shift = op.q_params['requant_shift']             # ndarray (Co,) or scalar
     acc_bits = int(op.q_params['acc_bits'])
+    per_channel = isinstance(requant_mult, np.ndarray)
 
     activation = op.attrs.get('activation', 'none')
 
@@ -268,6 +272,7 @@ def generate_conv1d(
     # header comment
     n_weights = C_out * C_in * kW
     n_biases = C_out if bias is not None else 0
+    requant_shift_val = int(requant_shift)
     lines += section_comment(
         f"{op.name}: Conv1D  in({C_in},{W_in}) "
         f"k({kW}) s({sW}) p({pW}) -> out({C_out},{W_out})"
@@ -276,13 +281,14 @@ def generate_conv1d(
         f"    // {n_weights} weights + {n_biases} biases hardwired"
     )
     lines.append(
-        f"    // Requantize: per-channel mult, shift={requant_shift}"
+        f"    // Requantize: {'per-channel' if per_channel else 'per-tensor'} mult, shift={requant_shift_val}"
     )
     lines.append("")
 
     # ---- per-output-element generation ---------------------------------
     for co in range(C_out):
-        mult_co = int(requant_mult[co])
+        mult_co = int(requant_mult[co]) if per_channel else int(requant_mult)
+        shift_co = int(requant_shift)
 
         for ow in range(W_out):
             flat_idx = co * W_out + ow
@@ -372,7 +378,7 @@ def generate_conv1d(
 
             # 3) requantize (per-channel)
             rq_lines, shifted = requantize_lines(
-                acc_name, acc_bits, mult_co, requant_shift, prefix
+                acc_name, acc_bits, mult_co, shift_co, prefix
             )
             lines += rq_lines
 

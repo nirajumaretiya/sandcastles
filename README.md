@@ -3,7 +3,7 @@
 **Compile neural network weights directly into synthesizable Verilog.**
 
 ```
-Trained model (.safetensors, .onnx, numpy)
+Trained model (.onnx, numpy)
         |
   [ sandcastles ]        
         |
@@ -38,7 +38,7 @@ This is the same core idea behind [Taalas](https://taalas.com/), which hard-wire
 | **Pooling** | MaxPool2D, AvgPool2D, GlobalAvgPool |
 | **Structural** | Add (residual), Multiply, Reshape, Flatten, Concat |
 
-Architecturally capable of compiling any modern LLM: DeepSeek, Llama, Qwen, Mistral, Gemma.
+Architecturally supports the building blocks used in modern LLMs (DeepSeek, Llama, Qwen, Mistral, Gemma). Tested end-to-end with GPT-2.
 
 **Quantization**: int4, int8, int16. Symmetric or asymmetric. Per-tensor or per-channel.
 
@@ -49,6 +49,8 @@ Architecturally capable of compiling any modern LLM: DeepSeek, Llama, Qwen, Mist
 **Compilation modes**:
 - *Combinational* — every weight gets its own multiplier. Max speed, max area.
 - *Sequential* — one multiplier + weight ROM + state machine. Minimal area, fits Tiny Tapeout.
+
+> **Note:** Sequential mode currently supports Dense, Conv1D, and Conv2D layers (with fused ReLU). Other operations use combinational logic.
 
 ## Quick start
 
@@ -125,9 +127,9 @@ Every weight is a literal constant. No RAM, no ROM, no bus. The model IS the cir
 ## Validated
 
 - Yosys synthesis: **zero errors** on all generated designs
-- GPT-2 block 0: **5.9M pre-trained weights** compiled in 5.1 seconds
-- Area estimator: **99.3% accuracy** vs actual Yosys gate count
-- Sequential mode: **46% fewer gates** than combinational for same network
+- GPT-2 block 0: **5.9M pre-trained weights** compiled in ~5 seconds
+- Area estimator: **~99% accuracy** vs actual Yosys gate count on tested designs
+- Sequential mode: significantly fewer gates than combinational for same network
 
 ## Architecture
 

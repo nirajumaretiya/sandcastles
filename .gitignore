@@ -7,3 +7,4 @@ build/
 output/
 *.v.bak
 .venv/
+.pytest_cache/

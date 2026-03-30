@@ -15,10 +15,10 @@ import math
 # ---------------------------------------------------------------------------
 
 def slit(bits: int, val: int) -> str:
-    """Signed Verilog literal.  slit(8, -5) -> \"-8'sd5\" """
+    """Signed Verilog literal.  slit(8, -5) -> \"(-8'sd5)\" """
     val = int(val)
     if val < 0:
-        return f"-{bits}'sd{-val}"
+        return f"(-{bits}'sd{-val})"
     return f"{bits}'sd{val}"
 
 
@@ -82,17 +82,23 @@ def requantize_lines(
     prefix: str,
 ) -> Tuple[List[str], str]:
     """
-    Generate the 64-bit requantization multiply + shift.
+    Generate the requantization multiply + shift.
+
+    The intermediate width is sized to fit the product (acc * 16-bit mult)
+    plus a small safety margin, instead of always using 64 bits.  This lets
+    synthesis tools use narrower multipliers where possible.
 
     Returns (verilog_lines, shifted_wire_name).
     """
-    ext64 = f"{prefix}_ext64"
+    prod_bits = min(acc_bits + 18, 64)  # acc * 16-bit mult + margin
+
+    ext = f"{prefix}_ext"
     prod = f"{prefix}_rprod"
     shifted = f"{prefix}_rsh"
     lines = [
-        sign_extend_wire(acc_name, acc_bits, ext64, 64),
-        f"    wire signed [63:0] {prod} = {ext64} * {slit(64, mult)};",
-        f"    wire signed [63:0] {shifted} = {prod} >>> {shift};",
+        sign_extend_wire(acc_name, acc_bits, ext, prod_bits),
+        f"    wire signed [{prod_bits - 1}:0] {prod} = {ext} * {slit(prod_bits, mult)};",
+        f"    wire signed [{prod_bits - 1}:0] {shifted} = {prod} >>> {shift};",
     ]
     return lines, shifted
 
@@ -112,6 +118,9 @@ def saturate_relu(src_name: str, src_bits: int,
 def saturate_linear(src_name: str, src_bits: int,
                     dst_name: str, dst_bits: int) -> List[str]:
     """Saturate *src* to signed int{dst_bits} range (no activation)."""
+    # Use symmetric range [-qmax, +qmax] (not [-qmax-1, +qmax]) to match
+    # symmetric quantization convention. Wastes one code point but simplifies
+    # the quantization math (zero point is always 0).
     qmax = 2 ** (dst_bits - 1) - 1
     return [
         f"    wire signed [{dst_bits - 1}:0] {dst_name} =",
@@ -171,6 +180,9 @@ def pwl_lut_lines(
     """
     lines = []
     acc_bits = 24  # enough for slope*input + offset
+    assert acc_bits >= 9, (
+        f"acc_bits={acc_bits} too small for >>> 8 shift in PWL output stage"
+    )
     lines.append(f"    // Piecewise-linear approximation ({len(slopes)} segments)")
     lines.append(f"    wire signed [{acc_bits - 1}:0] {lut_prefix}_val;")
 

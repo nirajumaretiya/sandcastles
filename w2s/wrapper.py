@@ -17,6 +17,62 @@ from w2s.core import ComputeGraph
 from w2s import emit
 
 
+def _op_output_size(op, graph: ComputeGraph) -> int:
+    """
+    Return the number of output elements for an operation.
+
+    Works for any op type:
+      - Dense/Conv: output channels from weight.shape[0]
+      - Element-wise (ReLU, etc.): same size as input tensor
+      - Fallback: 1
+    """
+    # Weighted ops: output size is the first dimension of the weight matrix
+    if 'weight' in op.q_weights:
+        return op.q_weights['weight'].shape[0]
+
+    # Element-wise ops: output size equals input size.
+    # Trace back through the graph to find the input tensor's size.
+    if op.inputs:
+        inp_tensor = op.inputs[0]
+        # Check if it's a graph-level input
+        if inp_tensor in graph.input_shapes:
+            shape = graph.input_shapes[inp_tensor]
+            numel = 1
+            for s in shape:
+                numel *= s
+            return numel
+        # Otherwise find the producing op and recurse
+        for prev_op in reversed(graph.operations):
+            if inp_tensor in prev_op.outputs:
+                return _op_output_size(prev_op, graph)
+
+    return 1
+
+
+def _get_output_port_names(graph: ComputeGraph) -> list:
+    """
+    Compute output port names using the same logic as graph.py:
+      - Single output:    out_{i}
+      - Multiple outputs: out_{output_name}_{i}
+    """
+    multi = len(graph.output_names) > 1
+    port_names = []
+    for out_name in graph.output_names:
+        # Determine number of elements for this output
+        n = 0
+        for op in reversed(graph.operations):
+            if out_name in op.outputs:
+                n = _op_output_size(op, graph)
+                break
+        n = max(n, 1)
+        for i in range(n):
+            if multi:
+                port_names.append(f"out_{out_name}_{i}")
+            else:
+                port_names.append(f"out_{i}")
+    return port_names
+
+
 def generate_serial_wrapper(
     graph: ComputeGraph,
     output_dir: str = ".",
@@ -36,6 +92,7 @@ def generate_serial_wrapper(
         ready       — high when idle, ready for new inputs
     """
     out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
     bits = graph.quant_config.bits
 
     # Compute total input/output counts
@@ -48,13 +105,10 @@ def generate_serial_wrapper(
         n_in += numel
 
     n_out = 0
-    # Estimate from operations (output shapes)
+    # Compute output count from each output op's actual output size
     for op in reversed(graph.operations):
         if any(o in graph.output_names for o in op.outputs):
-            if op.op_type.value == "dense" and 'weight' in op.q_weights:
-                n_out += op.q_weights['weight'].shape[0]
-            else:
-                n_out += 1  # fallback estimate
+            n_out += _op_output_size(op, graph)
     n_out = max(n_out, 1)
 
     addr_bits_in = max(math.ceil(math.log2(max(n_in, 2))), 1)
@@ -89,20 +143,20 @@ def generate_serial_wrapper(
     e()
 
     # State machine
-    e(f"    localparam IDLE    = 2'd0;")
-    e(f"    localparam LOADING = 2'd1;")
-    e(f"    localparam COMPUTE = 2'd2;")
-    e(f"    localparam OUTPUT  = 2'd3;")
+    e(f"    localparam IDLE    = 3'd0;")
+    e(f"    localparam LOADING = 3'd1;")
+    e(f"    localparam COMPUTE = 3'd2;")
+    e(f"    localparam OUTPUT  = 3'd3;")
+    e(f"    localparam DONE_ST = 3'd4;")
     e()
-    e(f"    reg [1:0] state;")
+    e(f"    reg [2:0] state;")
     e(f"    reg [{addr_bits_in}:0] in_count;")
     e(f"    reg [{addr_bits_out}:0] out_count;")
     e()
 
-    # Input buffer
+    # Input buffer — indexed array (synthesis can infer register file / RAM)
     e(f"    // Input buffer — holds all {n_in} inputs for the combinational core")
-    for i in range(n_in):
-        e(f"    reg signed [{bits-1}:0] in_buf_{i};")
+    e(f"    reg signed [{bits-1}:0] in_buf [0:{n_in - 1}];")
     e()
 
     # Instantiate combinational core
@@ -114,20 +168,32 @@ def generate_serial_wrapper(
         out_wires.append(wn)
     e()
 
-    e(f"    {core_name} core (")
-    conns = []
+    # Wire the indexed array to core input ports via assigns
+    e(f"    // Connect input buffer array to core input ports")
     idx = 0
+    core_in_wires = []
     for inp_name in graph.input_names:
         shape = graph.input_shapes.get(inp_name, (1,))
         numel = 1
         for s in shape:
             numel *= s
         for i in range(numel):
-            conns.append(f"        .{inp_name}_{i}(in_buf_{idx})")
+            wire_name = f"core_in_{idx}"
+            e(f"    wire signed [{bits-1}:0] {wire_name};")
+            e(f"    assign {wire_name} = in_buf[{idx}];")
+            core_in_wires.append((inp_name, i, wire_name))
             idx += 1
+    e()
+
+    e(f"    {core_name} core (")
+    conns = []
+    for inp_name, i, wire_name in core_in_wires:
+        conns.append(f"        .{inp_name}_{i}({wire_name})")
+    # Output port names must match graph.py: out_{name}_{i} when multiple
+    # outputs, out_{i} when single output
+    out_port_names = _get_output_port_names(graph)
     for i in range(n_out):
-        port_name = f"out_{i}"
-        conns.append(f"        .{port_name}({out_wires[i]})")
+        conns.append(f"        .{out_port_names[i]}({out_wires[i]})")
     e(",\n".join(conns))
     e(f"    );")
     e()
@@ -162,7 +228,7 @@ def generate_serial_wrapper(
     e(f"                    done      <= 0;")
     e(f"                    out_valid <= 0;")
     e(f"                    if (data_valid) begin")
-    e(f"                        in_buf_0 <= data_in;")
+    e(f"                        in_buf[0] <= data_in;")
     e(f"                        in_count <= 1;")
     e(f"                        state    <= LOADING;")
     e(f"                    end")
@@ -170,10 +236,7 @@ def generate_serial_wrapper(
     e()
     e(f"                LOADING: begin")
     e(f"                    if (data_valid) begin")
-    e(f"                        case (in_count)")
-    for i in range(1, n_in):
-        e(f"                            {addr_bits_in + 1}'d{i}: in_buf_{i} <= data_in;")
-    e(f"                        endcase")
+    e(f"                        in_buf[in_count] <= data_in;")
     e(f"                        if (in_count == {addr_bits_in + 1}'d{n_in - 1}) begin")
     e(f"                            state <= COMPUTE;")
     e(f"                        end")
@@ -183,24 +246,27 @@ def generate_serial_wrapper(
     e()
     e(f"                COMPUTE: begin")
     e(f"                    // Core is combinational — result is ready instantly")
+    e(f"                    // Don't emit data here; OUTPUT handles all emissions")
     e(f"                    out_count <= 0;")
-    e(f"                    data_out  <= out_mux;")
-    e(f"                    out_valid <= 1;")
     e(f"                    state     <= OUTPUT;")
     e(f"                end")
     e()
     e(f"                OUTPUT: begin")
-    e(f"                    data_out <= out_mux;")
+    e(f"                    data_out  <= out_mux;")
+    e(f"                    out_valid <= 1;")
     e(f"                    if (out_count == {addr_bits_out + 1}'d{n_out - 1}) begin")
-    e(f"                        out_valid <= 0;")
-    e(f"                        done      <= 1;")
-    e(f"                        in_count  <= 0;")
-    e(f"                        out_count <= 0;")
-    e(f"                        state     <= IDLE;")
+    e(f"                        state <= DONE_ST;")
     e(f"                    end else begin")
     e(f"                        out_count <= out_count + 1;")
-    e(f"                        out_valid <= 1;")
     e(f"                    end")
+    e(f"                end")
+    e()
+    e(f"                DONE_ST: begin")
+    e(f"                    out_valid <= 0;")
+    e(f"                    done      <= 1;")
+    e(f"                    in_count  <= 0;")
+    e(f"                    out_count <= 0;")
+    e(f"                    state     <= IDLE;")
     e(f"                end")
     e()
     e(f"            endcase")
@@ -248,8 +314,8 @@ def generate_tiny_tapeout_wrapper(
     e(f"// Protocol:")
     e(f"//   1. Assert rst_n low for one cycle to reset")
     e(f"//   2. Feed input bytes on ui_in with uio_in[0] (data_valid) high")
-    e(f"//   3. Read output bytes from uo_out when uio_out[0] (out_valid) is high")
-    e(f"//   4. uio_out[1] (done) goes high when all outputs sent")
+    e(f"//   3. Read output bytes from uo_out when uio_out[1] (out_valid) is high")
+    e(f"//   4. uio_out[2] (done) goes high when all outputs sent")
     e(f"// {'=' * 75}")
     e()
     e(f"module {name} (")
@@ -263,8 +329,13 @@ def generate_tiny_tapeout_wrapper(
     e(f"    input  wire       rst_n")
     e(f");")
     e()
-    e(f"    // Bidirectional pins: [0]=data_valid input, rest unused")
-    e(f"    assign uio_oe = 8'b0000_0011; // [1:0] are outputs")
+    e(f"    // Bidirectional pins:")
+    e(f"    //   [0] = data_valid INPUT  (active-high pulse)")
+    e(f"    //   [1] = out_valid  OUTPUT")
+    e(f"    //   [2] = done       OUTPUT")
+    e(f"    //   [3] = ready      OUTPUT")
+    e(f"    //   [7:4] unused")
+    e(f"    assign uio_oe = 8'b0000_1110; // bits [3:1] outputs, bit 0 input")
     e()
     e(f"    wire [{bits-1}:0] serial_out;")
     e(f"    wire out_valid;")
@@ -283,10 +354,11 @@ def generate_tiny_tapeout_wrapper(
     e(f"    );")
     e()
     e(f"    assign uo_out = serial_out;")
-    e(f"    assign uio_out[0] = out_valid;")
-    e(f"    assign uio_out[1] = done_sig;")
-    e(f"    assign uio_out[2] = ready_sig;")
-    e(f"    assign uio_out[7:3] = 5'b0;")
+    e(f"    assign uio_out[0] = 1'b0;      // bit 0 is input, keep driver low")
+    e(f"    assign uio_out[1] = out_valid;")
+    e(f"    assign uio_out[2] = done_sig;")
+    e(f"    assign uio_out[3] = ready_sig;")
+    e(f"    assign uio_out[7:4] = 4'b0;")
     e()
     e(f"endmodule")
 

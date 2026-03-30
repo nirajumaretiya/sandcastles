@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandcastles"
+version = "0.2.0"
+description = "Compile neural network weights directly into synthesizable Verilog"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+onnx = ["onnx"]
+huggingface = ["safetensors", "huggingface_hub"]
+dev = ["pytest"]
+
+[project.scripts]
+w2s = "w2s.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["w2s*"]

@@ -140,9 +140,16 @@ def generate_multiply(
             f"{a_ext} * {b_ext};"
         )
 
+        # Right-shift by (bits-1) to rescale (matches integer forward pass)
+        shift_name = f"{prefix}_shift"
+        lines.append(
+            f"    wire signed [{prod_bits - 1}:0] {shift_name} = "
+            f"{prod_name} >>> {bits - 1};"
+        )
+
         # Saturate back to target width
         out_wire = out_wire_names[i]
-        lines += saturate_linear(prod_name, prod_bits, out_wire, bits)
+        lines += saturate_linear(shift_name, prod_bits, out_wire, bits)
         lines.append("")
 
     # ---- build output TensorWires --------------------------------------
