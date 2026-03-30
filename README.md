@@ -159,7 +159,7 @@ w2s/
 
 ## Cheers to the future
 
-It feels like the window to democratize the near-term benefits of artificial intelligence as it currently exists is closing.  I want to contribute as much as possible to a future where people can still own and make things, and not rely on a supplier for perfomant LLMs.
+It feels like the window to democratize the near-term benefits of artificial intelligence as it currently exists is closing.  I want to contribute as much as possible to a future where people can still own and make things, and not rely on a supplier for performant LLMs.
 
 ## License
 
