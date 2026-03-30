@@ -33,6 +33,7 @@ def quantize_graph(
     graph: ComputeGraph,
     calibration_data: Dict[str, np.ndarray],
     config: QuantConfig = None,
+    bits_map: Optional[Dict[str, int]] = None,
 ) -> ComputeGraph:
     """
     Quantize all operations in the graph.
@@ -42,6 +43,14 @@ def quantize_graph(
     2. For each op, quantize weights and compute requantization
        parameters.
     3. Populate op.q_weights and op.q_params.
+
+    Args:
+        graph:            ComputeGraph with float weights.
+        calibration_data: {input_name: array} for activation range calibration.
+        config:           Default quantization config (bit width, scheme, etc.).
+        bits_map:         Optional per-layer bit width override.
+                          Maps op name -> bit width (4, 8, or 16).
+                          Ops not in the map use config.bits.
 
     Returns the same graph (mutated in place).
     """
@@ -56,17 +65,38 @@ def quantize_graph(
     tensor_ranges = calibrate(graph, calibration_data)
     graph.tensor_ranges = tensor_ranges
 
-    # Compute a scale for every tensor from its observed range
+    # For mixed precision, we need per-tensor scales at potentially different
+    # bit widths.  We compute scales at the default bit width, then override
+    # for ops with custom widths.  The key insight: tensor scales depend on
+    # the bit width of the consumer op, not the producer.
     tensor_scales: Dict[str, float] = {}
     for tname, (lo, hi) in tensor_ranges.items():
         tensor_scales[tname] = _scale_from_range(lo, hi, bits, scheme)
+
+    # If mixed precision, recompute scales for tensors consumed/produced
+    # by ops with custom bit widths
+    if bits_map:
+        ordered_ops = graph.topological_order()
+        for op in ordered_ops:
+            op_bits = bits_map.get(op.name, bits)
+            if op_bits != bits:
+                # Store per-op bits for use during Verilog generation
+                op.attrs['bits'] = op_bits
+                # Recompute output tensor scales at this op's bit width
+                for out_name in op.outputs:
+                    if out_name in tensor_ranges:
+                        lo, hi = tensor_ranges[out_name]
+                        tensor_scales[out_name] = _scale_from_range(
+                            lo, hi, op_bits, scheme)
+
     graph.tensor_scales = tensor_scales
 
     # Step 2 -- quantize in topological order
     ordered_ops = graph.topological_order()
 
     for op in ordered_ops:
-        _quantize_op(op, tensor_scales, bits, scheme, granularity)
+        op_bits = bits if bits_map is None else bits_map.get(op.name, bits)
+        _quantize_op(op, tensor_scales, op_bits, scheme, granularity)
 
     return graph
 
@@ -836,17 +866,17 @@ def compute_requant(
 
     ratio = output_scale / acc_scale
 
-    # Try the requested shift; increase if M overflows int32
-    for s in range(shift, shift + 16):
+    # Try the requested shift; if M overflows int32, try smaller shifts
+    # to reduce the multiplier magnitude.  Fall back to clamping if needed.
+    for s in range(shift, max(shift - 16, 0), -1):
         M = round(ratio * (1 << s))
         if abs(M) <= 0x7FFFFFFF:
             return int(M), int(s)
 
-    # Fallback: use the largest valid multiplier
-    s = shift
-    M = round(ratio * (1 << s))
+    # Fallback: use the requested shift with clamped multiplier
+    M = round(ratio * (1 << shift))
     M = max(-0x7FFFFFFF, min(0x7FFFFFFF, M))
-    return int(M), int(s)
+    return int(M), int(shift)
 
 
 # ---------------------------------------------------------------------------
@@ -999,11 +1029,17 @@ def _compute_mac_requant(
     if granularity == QuantGranularity.PER_CHANNEL and weight.ndim >= 2:
         n_out = weight.shape[0]
         requant_mults = np.zeros(n_out, dtype=np.int64)
-        shift = 16
+        # Two-pass approach: first find the maximum shift needed across
+        # all channels, then recompute all multipliers with that shift.
+        shifts = np.zeros(n_out, dtype=np.int64)
+        for c in range(n_out):
+            m, s = compute_requant(input_scale, w_scales[c], output_scale, 16)
+            requant_mults[c] = m
+            shifts[c] = s
+        shift = int(np.max(shifts))
         for c in range(n_out):
             m, s = compute_requant(input_scale, w_scales[c], output_scale, shift)
             requant_mults[c] = m
-            shift = s                      # keep the same shift for all channels
         op.q_params = {
             'requant_mult': requant_mults,
             'requant_shift': shift,

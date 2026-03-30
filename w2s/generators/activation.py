@@ -22,7 +22,6 @@ from w2s.emit import (
     slit,
     ulit,
     wire_signed,
-    reg_signed,
     sign_extend_expr,
     pwl_lut_lines,
     section_comment,

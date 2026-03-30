@@ -9,7 +9,6 @@ Usage:
 
 import argparse
 import sys
-import os
 import numpy as np
 from pathlib import Path
 
@@ -96,6 +95,30 @@ def _count_q_params(graph):
 #  Command: compile
 # ---------------------------------------------------------------------------
 
+def _parse_bits_map(bits_map_str: str) -> dict:
+    """Parse a bits-map string like 'layer1=4,layer2=16' into a dict."""
+    if not bits_map_str:
+        return None
+    result = {}
+    for pair in bits_map_str.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(
+                f"Malformed bits-map entry '{pair}': expected 'name=bits' format"
+            )
+        name, val = pair.split("=", 1)
+        try:
+            result[name.strip()] = int(val.strip())
+        except ValueError:
+            raise ValueError(
+                f"Invalid bit width in bits-map entry '{pair}': "
+                f"'{val.strip()}' is not an integer"
+            )
+    return result if result else None
+
+
 def cmd_compile(args):
     from w2s.core import QuantConfig, QuantScheme, QuantGranularity
 
@@ -106,6 +129,14 @@ def cmd_compile(args):
     print(f"  Name  : {model_name}")
     print(f"  Bits  : {args.bits}")
     print(f"  Output: {args.output}")
+
+    bits_map = _parse_bits_map(getattr(args, 'bits_map', None))
+    if bits_map:
+        print(f"  Mixed : {bits_map}")
+
+    target = getattr(args, 'target', 'asic')
+    if target == 'fpga':
+        print(f"  Target: FPGA ({getattr(args, 'device', 'ice40up5k')})")
     print()
 
     # 1. Load
@@ -127,7 +158,6 @@ def cmd_compile(args):
     calib_data = {}
     for inp_name in graph.input_names:
         shape = graph.input_shapes.get(inp_name, (1,))
-        # Prepend a batch dimension of 4 samples for calibration
         calib_shape = (4,) + tuple(shape)
         calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
 
@@ -135,10 +165,17 @@ def cmd_compile(args):
     print("       supply real calibration data from your dataset.")
 
     from w2s.quantize import quantize_graph
-    graph = quantize_graph(graph, calib_data, config)
+    graph = quantize_graph(graph, calib_data, config, bits_map=bits_map)
 
     q_params = _count_q_params(graph)
     print(f"       Quantized {q_params:,} parameters to int{args.bits}")
+
+    # 2b. Sparsity report
+    from w2s.sparsity import analyze_sparsity
+    sp_report = analyze_sparsity(graph)
+    if sp_report.overall_sparsity > 0.01:
+        print(f"       Sparsity: {sp_report.overall_sparsity:.1%} "
+              f"({sp_report.eliminated_multipliers:,} multipliers eliminated)")
 
     # 3. Select mode
     mode = args.mode
@@ -158,6 +195,18 @@ def cmd_compile(args):
     print(f"  Verilog : {output_path}")
     print(f"  Mode    : {mode}")
     print(f"  Params  : {q_params:,} (all hardwired as constants)")
+
+    # FPGA build script
+    if target == 'fpga':
+        from w2s.fpga import generate_build_script, generate_constraints, DEVICES
+        device_name = getattr(args, 'device', 'ice40up5k')
+        device = DEVICES.get(device_name)
+        if device:
+            mk_path = generate_build_script(graph, device, args.output, mode)
+            pcf_path = generate_constraints(graph, device, args.output, mode)
+            print(f"  Makefile: {mk_path}")
+            print(f"  Pins   : {pcf_path}")
+
     print()
 
 
@@ -196,47 +245,140 @@ def cmd_estimate(args):
 
     modes = [args.mode] if args.mode != "both" else ["combinational", "sequential"]
 
-    # Try the estimate module (may not exist yet)
-    try:
-        from w2s.estimate import estimate as run_estimate
-        has_estimator = True
-    except ImportError:
-        has_estimator = False
-
-    if has_estimator:
-        for mode in modes:
-            print(f"\n--- {mode} ---")
-            report = run_estimate(graph, mode=mode)
-            print(report)
-    else:
-        # Fallback: print basic parameter counts
-        print("  Note: w2s.estimate module not yet available.")
-        print("  Showing basic parameter summary instead.")
-        print()
-        print(f"  Operations     : {len(graph.operations)}")
-        print(f"  Total params   : {total_params:,}")
-        print(f"  Quantized bits : {args.bits}")
-        print(f"  Weight memory  : {total_params * args.bits / 8 / 1024:.1f} KB (quantized)")
+    # Sparsity report
+    from w2s.sparsity import analyze_sparsity
+    sp_report = analyze_sparsity(graph)
+    if sp_report.overall_sparsity > 0.001:
+        print(sp_report)
         print()
 
-        for mode in modes:
-            print(f"  --- {mode} ---")
-            if mode == "combinational":
-                # Rough gate estimate: each multiply-accumulate ~ bits^2 gates
-                est_gates = total_params * (args.bits ** 2)
-                print(f"  Est. logic gates : ~{est_gates:,}")
-                print(f"  Est. area (ASIC) : ~{est_gates * 5 / 1e6:.2f} mm^2 (@ 5 um^2/gate, 28nm)")
-            else:
-                est_gates = 50000 * (args.bits ** 2)
-                print(f"  Est. logic gates : ~{est_gates:,} (MAC unit + control)")
-                print(f"  Est. SRAM        : ~{total_params * args.bits / 8 / 1024:.1f} KB (weight storage)")
-                print(f"  Est. cycles      : ~{total_params:,} (one MAC/cycle)")
-            print()
+    # ASIC estimate
+    from w2s.estimate import estimate as run_estimate
+    for mode in modes:
+        print(f"\n--- ASIC {mode} ---")
+        report = run_estimate(graph, mode=mode)
+        print(report)
+
+    # FPGA estimate (if requested)
+    target = getattr(args, 'target', 'asic')
+    if target in ('fpga', 'both'):
+        from w2s.fpga import estimate_fpga, DEVICES
+        device_name = getattr(args, 'device', 'ice40up5k')
+        device = DEVICES.get(device_name)
+        if device:
+            for mode in modes:
+                print(f"\n--- FPGA {device.name} {mode} ---")
+                fpga_report = estimate_fpga(graph, device, mode)
+                print(fpga_report)
 
 
 # ---------------------------------------------------------------------------
 #  Command: info
 # ---------------------------------------------------------------------------
+
+def cmd_testbench(args):
+    """Generate a testbench with golden vectors from the quantized model."""
+    print(BANNER)
+    print()
+    print(f"  Model : {args.model}")
+    print(f"  Bits  : {args.bits}")
+    print(f"  Output: {args.output}")
+    print()
+
+    from w2s.core import QuantConfig, QuantScheme, QuantGranularity
+
+    model_name = args.name or Path(args.model).stem
+
+    # 1. Load
+    print("[1/3] Loading model...")
+    graph = _load_model(args.model, name=model_name)
+    total_params = _count_params(graph)
+    print(f"       {len(graph.operations)} operations, {total_params:,} parameters")
+
+    # 2. Quantize
+    print(f"[2/3] Quantizing to int{args.bits}...")
+    config = QuantConfig(
+        bits=args.bits,
+        scheme=QuantScheme.SYMMETRIC,
+        granularity=QuantGranularity.PER_TENSOR,
+    )
+    graph.quant_config = config
+
+    calib_data = {}
+    for inp_name in graph.input_names:
+        shape = graph.input_shapes.get(inp_name, (1,))
+        calib_shape = (4,) + tuple(shape)
+        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+
+    from w2s.quantize import quantize_graph
+    graph = quantize_graph(graph, calib_data, config)
+
+    # 3. Generate golden vectors and testbench
+    print("[3/3] Generating testbench...")
+    n_vectors = getattr(args, 'vectors', 4)
+    vcd = getattr(args, 'vcd', False)
+    tolerance = getattr(args, 'tolerance', 0)
+
+    # Generate test inputs (random quantized values)
+    test_inputs = {}
+    bits = args.bits
+    qmax = 2 ** (bits - 1) - 1
+    for inp_name in graph.input_names:
+        shape = graph.input_shapes.get(inp_name, (1,))
+        numel = 1
+        for s in shape:
+            numel *= s
+        test_inputs[inp_name] = np.random.randint(
+            -qmax, qmax + 1, size=(n_vectors, numel)).astype(np.int64)
+
+    # Run integer forward pass for golden outputs
+    from w2s.graph import forward_int, generate_testbench
+
+    # Run forward pass per vector
+    all_outputs = {}
+    for t in range(n_vectors):
+        single_input = {}
+        for inp_name in graph.input_names:
+            vec = test_inputs[inp_name][t].astype(np.float64)
+            scale = graph.tensor_scales.get(inp_name, 1.0)
+            single_input[inp_name] = vec / scale if scale != 0 else vec
+        outputs = forward_int(graph, single_input)
+        for out_name, val in outputs.items():
+            if out_name not in all_outputs:
+                all_outputs[out_name] = []
+            all_outputs[out_name].append(val.flatten())
+
+    expected_outputs = {}
+    for out_name, vecs in all_outputs.items():
+        expected_outputs[out_name] = np.stack(vecs, axis=0)
+
+    mode = getattr(args, 'mode', 'combinational')
+
+    tb_path = None
+    if mode in ("combinational", "both"):
+        tb_path = generate_testbench(
+            graph, test_inputs, expected_outputs,
+            output_dir=args.output, vcd=vcd, tolerance=tolerance,
+        )
+
+    if mode in ("sequential", "both"):
+        from w2s.graph import generate_sequential_testbench
+        seq_tb = generate_sequential_testbench(
+            graph, test_inputs, expected_outputs,
+            output_dir=args.output, vcd=vcd, tolerance=tolerance,
+        )
+        print(f"  Sequential TB: {seq_tb}")
+        if tb_path is None:
+            tb_path = seq_tb
+
+    print()
+    print("  Done!")
+    print(f"  Testbench: {tb_path}")
+    print(f"  Vectors  : {n_vectors}")
+    if vcd:
+        print(f"  VCD dump : enabled")
+    print()
+
 
 def cmd_info(args):
     print(BANNER)
@@ -338,6 +480,23 @@ def build_parser():
         default=None,
         help="Verilog module name (default: derived from filename)",
     )
+    p_compile.add_argument(
+        "--bits-map",
+        default=None,
+        help="Mixed-precision per-layer bit widths (e.g., 'hidden=4,output=16')",
+    )
+    p_compile.add_argument(
+        "--target", "-t",
+        choices=["asic", "fpga"],
+        default="asic",
+        help="Target platform (default: asic)",
+    )
+    p_compile.add_argument(
+        "--device",
+        choices=["ice40up5k", "ice40hx8k", "ecp5-25k", "ecp5-85k"],
+        default="ice40up5k",
+        help="FPGA device (only used with --target fpga, default: ice40up5k)",
+    )
 
     # --- estimate ---
     p_estimate = subparsers.add_parser(
@@ -360,6 +519,69 @@ def build_parser():
         choices=[4, 8, 16],
         default=8,
         help="Quantization bit width (default: 8)",
+    )
+    p_estimate.add_argument(
+        "--target", "-t",
+        choices=["asic", "fpga", "both"],
+        default="asic",
+        help="Target platform for estimation (default: asic)",
+    )
+    p_estimate.add_argument(
+        "--device",
+        choices=["ice40up5k", "ice40hx8k", "ecp5-25k", "ecp5-85k"],
+        default="ice40up5k",
+        help="FPGA device (only used with --target fpga/both, default: ice40up5k)",
+    )
+
+    # --- testbench ---
+    p_testbench = subparsers.add_parser(
+        "testbench",
+        help="Generate a Verilog testbench with golden vectors",
+    )
+    p_testbench.add_argument(
+        "model",
+        help="Path to model file (.onnx or .safetensors)",
+    )
+    p_testbench.add_argument(
+        "--output", "-o",
+        default="./output",
+        help="Output directory (default: ./output)",
+    )
+    p_testbench.add_argument(
+        "--bits", "-b",
+        type=int,
+        choices=[4, 8, 16],
+        default=8,
+        help="Quantization bit width (default: 8)",
+    )
+    p_testbench.add_argument(
+        "--name", "-n",
+        default=None,
+        help="Verilog module name (default: derived from filename)",
+    )
+    p_testbench.add_argument(
+        "--vectors", "-v",
+        type=int,
+        default=4,
+        help="Number of test vectors to generate (default: 4)",
+    )
+    p_testbench.add_argument(
+        "--vcd",
+        action="store_true",
+        default=False,
+        help="Include VCD waveform dump in testbench",
+    )
+    p_testbench.add_argument(
+        "--tolerance",
+        type=int,
+        default=0,
+        help="Allowed output tolerance in LSBs (default: 0 = exact match)",
+    )
+    p_testbench.add_argument(
+        "--mode", "-m",
+        choices=["combinational", "sequential", "both"],
+        default="combinational",
+        help="Generate testbench for which mode (default: combinational)",
     )
 
     # --- info ---
@@ -392,6 +614,8 @@ def main():
             cmd_compile(args)
         elif args.command == "estimate":
             cmd_estimate(args)
+        elif args.command == "testbench":
+            cmd_testbench(args)
         elif args.command == "info":
             cmd_info(args)
     except KeyboardInterrupt:

@@ -129,7 +129,8 @@ def generate_dense(
         lines += rq_lines
 
         # Saturate (with optional fused ReLU)
-        lines += emit.saturate(shifted_wire, 64, out_wire, bits, activation)
+        prod_bits = min(acc_bits + 18, 64)
+        lines += emit.saturate(shifted_wire, prod_bits, out_wire, bits, activation)
         lines.append("")
 
     # --- Build output TensorWires ---

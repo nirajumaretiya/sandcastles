@@ -54,7 +54,7 @@ def generate_conv2d(
     pH, pW = op.attrs.get('padding', (0, 0))
 
     requant_mult = op.q_params['requant_mult']              # ndarray (Co,) or scalar
-    requant_shift = op.q_params['requant_shift']             # ndarray (Co,) or scalar
+    requant_shift = op.q_params['requant_shift']             # int (shared across all channels)
     acc_bits = int(op.q_params['acc_bits'])
     per_channel = isinstance(requant_mult, np.ndarray)
 
@@ -200,7 +200,8 @@ def generate_conv2d(
 
                 # 4) saturate + optional activation
                 out_wire = out_wire_names[flat_idx]
-                lines += saturate(shifted, 64, out_wire, bits, activation)
+                prod_bits = min(acc_bits + 18, 64)
+                lines += saturate(shifted, prod_bits, out_wire, bits, activation)
                 lines.append("")
 
     # ---- build output TensorWires --------------------------------------
@@ -248,7 +249,7 @@ def generate_conv1d(
         pW = pW[0]
 
     requant_mult = op.q_params['requant_mult']              # ndarray (Co,) or scalar
-    requant_shift = op.q_params['requant_shift']             # ndarray (Co,) or scalar
+    requant_shift = op.q_params['requant_shift']             # int (shared across all channels)
     acc_bits = int(op.q_params['acc_bits'])
     per_channel = isinstance(requant_mult, np.ndarray)
 
@@ -384,7 +385,8 @@ def generate_conv1d(
 
             # 4) saturate + optional activation
             out_wire = out_wire_names[flat_idx]
-            lines += saturate(shifted, 64, out_wire, bits, activation)
+            prod_bits = min(acc_bits + 18, 64)
+            lines += saturate(shifted, prod_bits, out_wire, bits, activation)
             lines.append("")
 
     # ---- build output TensorWires --------------------------------------

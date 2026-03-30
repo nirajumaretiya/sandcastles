@@ -6,7 +6,6 @@ RESHAPE and FLATTEN are zero-cost rewirings (no logic emitted).
 CONCAT joins wire-name lists along the specified axis.
 """
 
-import math
 from typing import Dict, List, Tuple
 
 from w2s.core import Operation, TensorWires
@@ -17,7 +16,6 @@ from w2s.emit import (
     sign_extend_expr,
     slit,
     saturate_linear,
-    acc_bits_for,
 )
 
 

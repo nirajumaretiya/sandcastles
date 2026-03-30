@@ -77,6 +77,10 @@ class EstimateReport:
     tt_tiles_needed: int
     warnings: List[str] = field(default_factory=list)
 
+    # Sparsity info
+    sparsity: float = 0.0
+    multipliers_eliminated: int = 0
+
     # Optional breakdown for pretty-printing
     _breakdown: Dict[str, int] = field(default_factory=dict, repr=False)
 
@@ -87,6 +91,9 @@ class EstimateReport:
         lines.append(f"=== Area Estimate ({self.mode} mode) ===")
         lines.append(f"Parameters:      {self.total_params:,} "
                      f"({self.rom_bits:,} bits)")
+        if self.sparsity > 0.001:
+            lines.append(f"Sparsity:        {self.sparsity:.1%} "
+                         f"({self.multipliers_eliminated:,} multipliers eliminated)")
 
         if self.mode == "sequential":
             rom_luts = self._breakdown.get("rom_luts", 0)
@@ -220,16 +227,36 @@ def _analyze_op(op: Operation, bits: int) -> Dict:
         "n_additions": 0,
         "n_neurons": 0,
         "output_size": 0,
+        "n_zero_weights": 0,
+        "sparsity": 0.0,
     }
+
+    # Count zero weights for sparsity-aware estimation
+    weight_keys = _weight_keys_for_op(op)
+    total_weight_elems = 0
+    zero_weight_elems = 0
+    for key in weight_keys:
+        w = weights.get(key)
+        if w is not None:
+            total_weight_elems += w.size
+            zero_weight_elems += int(np.count_nonzero(w == 0))
+    info["n_zero_weights"] = zero_weight_elems
+    if total_weight_elems > 0:
+        info["sparsity"] = zero_weight_elems / total_weight_elems
 
     if op.op_type == OpType.DENSE:
         w = weights.get("weight")
         if w is not None:
             n_out, n_in = w.shape
+            n_nonzero = int(np.count_nonzero(w))
             info["n_in"] = n_in
             info["n_out"] = n_out
-            info["n_multiplies"] = n_in * n_out
-            info["n_additions"] = (n_in - 1) * n_out  # adder tree per neuron
+            info["n_multiplies"] = n_nonzero  # sparsity-aware
+            # adders = one less than non-zero terms per neuron
+            info["n_additions"] = sum(
+                max(int(np.count_nonzero(w[j])) - 1, 0)
+                for j in range(n_out)
+            )
             info["n_neurons"] = n_out
             info["output_size"] = n_out
 
@@ -238,15 +265,14 @@ def _analyze_op(op: Operation, bits: int) -> Dict:
         if w is not None:
             c_out, c_in, kh, kw = w.shape
             kernel_elems = c_in * kh * kw
-            # Output spatial size depends on input -- estimate from attrs
-            stride = op.attrs.get("stride", (1, 1))
-            padding = op.attrs.get("padding", (0, 0))
-            # Without knowing input spatial dims exactly, estimate based on
-            # a common scenario.  The param-based cost is dominant anyway.
+            n_nonzero = int(np.count_nonzero(w))
             info["n_in"] = kernel_elems
             info["n_out"] = c_out
-            info["n_multiplies"] = n_params - c_out  # exclude bias
-            info["n_additions"] = (kernel_elems - 1) * c_out
+            info["n_multiplies"] = n_nonzero  # sparsity-aware
+            info["n_additions"] = sum(
+                max(int(np.count_nonzero(w[co])) - 1, 0)
+                for co in range(c_out)
+            )
             info["n_neurons"] = c_out
             info["output_size"] = c_out
 
@@ -255,10 +281,14 @@ def _analyze_op(op: Operation, bits: int) -> Dict:
         if w is not None:
             c_out, c_in, k = w.shape
             kernel_elems = c_in * k
+            n_nonzero = int(np.count_nonzero(w))
             info["n_in"] = kernel_elems
             info["n_out"] = c_out
-            info["n_multiplies"] = n_params - c_out
-            info["n_additions"] = (kernel_elems - 1) * c_out
+            info["n_multiplies"] = n_nonzero
+            info["n_additions"] = sum(
+                max(int(np.count_nonzero(w[co])) - 1, 0)
+                for co in range(c_out)
+            )
             info["n_neurons"] = c_out
             info["output_size"] = c_out
 
@@ -271,29 +301,46 @@ def _analyze_op(op: Operation, bits: int) -> Dict:
             info["output_size"] = dim
 
     elif op.op_type == OpType.MULTI_HEAD_ATTENTION:
-        # 4 dense projections: Q, K, V, Out
         for key in ("q_weight", "k_weight", "v_weight", "out_weight"):
             w = weights.get(key)
             if w is not None:
+                n_nonzero = int(np.count_nonzero(w))
                 n_out_w, n_in_w = w.shape
-                info["n_multiplies"] += n_in_w * n_out_w
-                info["n_additions"] += (n_in_w - 1) * n_out_w
+                info["n_multiplies"] += n_nonzero
+                info["n_additions"] += sum(
+                    max(int(np.count_nonzero(w[j])) - 1, 0)
+                    for j in range(n_out_w)
+                )
         embed_dim = op.attrs.get("embed_dim", 0)
         info["n_in"] = embed_dim
         info["n_out"] = embed_dim
-        info["n_neurons"] = embed_dim * 4  # Q + K + V + Out projections
+        info["n_neurons"] = embed_dim * 4
         info["output_size"] = embed_dim
 
     elif op.op_type in (OpType.LAYERNORM, OpType.RMSNORM, OpType.BATCHNORM):
-        info["n_neurons"] = n_params  # scale + bias elements
+        info["n_neurons"] = n_params
         info["output_size"] = n_params
 
     elif op.op_type in (OpType.RELU, OpType.GELU, OpType.SIGMOID,
                         OpType.TANH, OpType.SILU, OpType.SOFTMAX):
-        # Element-wise: cost proportional to input size, no weight params
         pass
 
     return info
+
+
+def _weight_keys_for_op(op: Operation) -> List[str]:
+    """Return weight tensor keys that contribute to multiplier count."""
+    if op.op_type in (OpType.DENSE, OpType.CONV1D, OpType.CONV2D):
+        return ['weight']
+    if op.op_type in (OpType.MULTI_HEAD_ATTENTION, OpType.GROUPED_QUERY_ATTENTION):
+        return ['q_weight', 'k_weight', 'v_weight', 'out_weight']
+    if op.op_type == OpType.SWIGLU:
+        return ['gate_weight', 'up_weight', 'down_weight']
+    if op.op_type == OpType.EMBEDDING:
+        return ['weight']
+    if op.op_type in (OpType.LAYERNORM, OpType.RMSNORM, OpType.BATCHNORM):
+        return ['scale']
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +436,16 @@ def _estimate_combinational(
             "Large combinational design: synthesis may be slow. "
             "Consider sequential mode for smaller area.")
 
+    # Compute sparsity stats
+    total_zeros = sum(info.get("n_zero_weights", 0) for info in layer_info)
+    total_weight_elems = sum(
+        sum(w.size for k, w in (info["op"].q_weights or info["op"].weights).items()
+            if k in _weight_keys_for_op(info["op"]))
+        for info in layer_info
+        if _weight_keys_for_op(info["op"])
+    )
+    overall_sparsity = total_zeros / total_weight_elems if total_weight_elems > 0 else 0.0
+
     return EstimateReport(
         total_params=total_params,
         total_multipliers=total_multipliers,
@@ -403,6 +460,8 @@ def _estimate_combinational(
         fits_tiny_tapeout=fits,
         tt_tiles_needed=tt_tiles,
         warnings=warnings,
+        sparsity=overall_sparsity,
+        multipliers_eliminated=total_zeros,
         _breakdown={
             "multiplier_luts": multiplier_luts,
             "adder_luts": adder_luts,
@@ -527,14 +586,14 @@ def _estimate_sequential(
 def graph_input_sizes(ops: List[Operation]) -> List[int]:
     """Estimate input tensor sizes from the first layer's n_in."""
     sizes = []
-    for info_op in ops:
-        if info_op.op_type in (OpType.DENSE, OpType.CONV2D, OpType.CONV1D):
-            weights = info_op.q_weights if info_op.q_weights else info_op.weights
+    for op in ops:
+        if op.op_type in (OpType.DENSE, OpType.CONV2D, OpType.CONV1D):
+            weights = op.q_weights if op.q_weights else op.weights
             w = weights.get("weight")
             if w is not None:
-                if info_op.op_type == OpType.DENSE:
+                if op.op_type == OpType.DENSE:
                     sizes.append(w.shape[1])  # n_in
-                elif info_op.op_type in (OpType.CONV2D, OpType.CONV1D):
+                elif op.op_type in (OpType.CONV2D, OpType.CONV1D):
                     sizes.append(int(np.prod(w.shape[1:])))
             break  # only need first layer
     return sizes

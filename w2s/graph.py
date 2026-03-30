@@ -98,9 +98,18 @@ def compile_graph(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    bits = graph.quant_config.bits
+    default_bits = graph.quant_config.bits
     ops = graph.topological_order()
     lines: List[str] = []
+
+    # Check for mixed precision
+    mixed_precision = any(op.attrs.get('bits') for op in ops)
+    bits_desc = f"int{default_bits}"
+    if mixed_precision:
+        unique_bits = sorted(set(
+            op.attrs.get('bits', default_bits) for op in ops
+        ))
+        bits_desc = "mixed [" + "/".join(f"int{b}" for b in unique_bits) + "]"
 
     # --- Header ---
     arch_parts = []
@@ -123,13 +132,14 @@ def compile_graph(
     lines.append(f"//")
     lines.append(f"// Operations  : {len(ops)}")
     lines.append(f"// Parameters  : {total_params:,} (all hardwired)")
-    lines.append(f"// Quantization: int{bits} ({graph.quant_config.scheme.value}, "
+    lines.append(f"// Quantization: {bits_desc} ({graph.quant_config.scheme.value}, "
                  f"{graph.quant_config.granularity.value})")
     lines.append(f"// {'=' * 75}")
     lines.append("")
 
     # --- Determine module ports from graph inputs/outputs ---
     # Flatten input shapes to individual wires
+    bits = default_bits  # used for input/output ports
     in_ports: List[Tuple[str, int]] = []
     wire_map: Dict[str, TensorWires] = {}
 
@@ -159,8 +169,11 @@ def compile_graph(
                     wire_map[out_name] = wire_map[op.inputs[0]]
             continue
 
+        # Mixed precision: use per-op bits if set, else default
+        op_bits = op.attrs.get('bits', default_bits)
+
         try:
-            new_lines, new_wires = gen(op, wire_map, bits)
+            new_lines, new_wires = gen(op, wire_map, op_bits)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to generate Verilog for op '{op.name}' ({op.op_type.name}): {e}"
@@ -208,12 +221,20 @@ def generate_testbench(
     test_inputs: Dict[str, np.ndarray],
     expected_outputs: Dict[str, np.ndarray],
     output_dir: str = ".",
+    vcd: bool = False,
+    tolerance: int = 0,
 ) -> str:
     """
     Generate a Verilog testbench for the compiled design.
 
-    test_inputs:     {input_tensor_name: array of quantized int values}
-    expected_outputs: {output_tensor_name: array of expected int values}
+    Args:
+        test_inputs:      {input_tensor_name: array of quantized int values}
+        expected_outputs:  {output_tensor_name: array of expected int values}
+        output_dir:       Where to write the testbench.
+        vcd:              If True, add $dumpfile/$dumpvars for waveform capture.
+        tolerance:        Allow outputs to differ by up to this many LSBs.
+
+    Returns path to the generated _tb.v file.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -263,12 +284,20 @@ def generate_testbench(
     lines.append("")
 
     lines.append("    integer errors;")
+    lines.append("    integer total_checks;")
     lines.append("")
     lines.append("    initial begin")
+
+    # VCD dump
+    if vcd:
+        lines.append(f'        $dumpfile("{graph.name}_tb.vcd");')
+        lines.append(f"        $dumpvars(0, {graph.name}_tb);")
+        lines.append("")
+
     lines.append("        errors = 0;")
+    lines.append("        total_checks = 0;")
 
     # Generate test vectors
-    # For now, support single-vector tests
     n_tests = 0
     for inp_name in graph.input_names:
         if inp_name in test_inputs:
@@ -280,7 +309,6 @@ def generate_testbench(
     for t in range(n_tests):
         lines.append(f"")
         lines.append(f"        // --- Test vector {t} ---")
-        idx = 0
         for inp_name in graph.input_names:
             if inp_name in test_inputs:
                 data = test_inputs[inp_name]
@@ -298,21 +326,253 @@ def generate_testbench(
                     exp_data = exp_data.reshape(1, -1)
                 if t < exp_data.shape[0]:
                     exp_val = int(exp_data[t].flatten()[i])
-                    lines.append(f"        if ({wn} !== {emit.slit(bits, exp_val)}) begin")
-                    lines.append(f'            $display("FAIL vec {t} {wn}: '
-                                f'got %0d expected {exp_val}", {wn});')
-                    lines.append(f"            errors = errors + 1;")
-                    lines.append(f"        end")
+                    lines.append(f"        total_checks = total_checks + 1;")
+                    if tolerance > 0:
+                        # Use named wires in a begin/end block to avoid
+                        # illegal bit-selects on literal constants in Verilog-2001
+                        exp_wire = f"exp_{wn}_v{t}"
+                        diff_wire = f"diff_{wn}_v{t}"
+                        lines.append(f"        // Tolerance check for {wn}")
+                        lines.append(f"        begin")
+                        lines.append(f"            wire signed [{bits-1}:0] {exp_wire} = {emit.slit(bits, exp_val)};")
+                        lines.append(f"            wire signed [{bits}:0] {diff_wire} = "
+                                     f"{{{{1{{{wn}[{bits-1}]}}}}, {wn}}} - "
+                                     f"{{{{1{{{exp_wire}[{bits-1}]}}}}, {exp_wire}}};")
+                        lines.append(f"            if ({diff_wire} > {tolerance} || {diff_wire} < -{tolerance}) begin")
+                        lines.append(f'                $display("FAIL vec {t} {wn}: '
+                                    f'got %0d expected {exp_val}", {wn});')
+                        lines.append(f"                errors = errors + 1;")
+                        lines.append(f"            end")
+                        lines.append(f"        end")
+                    else:
+                        lines.append(f"        if ({wn} !== {emit.slit(bits, exp_val)}) begin")
+                        lines.append(f'            $display("FAIL vec {t} {wn}: '
+                                    f'got %0d expected {exp_val}", {wn});')
+                        lines.append(f"            errors = errors + 1;")
+                        lines.append(f"        end")
 
     lines.append("")
-    lines.append(f'        if (errors == 0) $display("PASS — all {n_tests} vectors verified");')
-    lines.append(f'        else $display("FAILED — %0d errors", errors);')
+    lines.append(f'        $display("Results: %0d/%0d checks passed", '
+                 f'total_checks - errors, total_checks);')
+    lines.append(f'        if (errors == 0) $display("PASS — all {n_tests} test vectors verified");')
+    lines.append(f'        else $display("FAILED — %0d errors in %0d checks", errors, total_checks);')
     lines.append("        $finish;")
     lines.append("    end")
     lines.append("")
     lines.append("endmodule")
 
     tb_path = out / f"{graph.name}_tb.v"
+    tb_path.write_text("\n".join(lines), encoding="utf-8")
+    return str(tb_path)
+
+
+def generate_sequential_testbench(
+    graph: ComputeGraph,
+    test_inputs: Dict[str, np.ndarray],
+    expected_outputs: Dict[str, np.ndarray],
+    output_dir: str = ".",
+    vcd: bool = False,
+    tolerance: int = 0,
+) -> str:
+    """
+    Generate a Verilog testbench for the sequential (clocked) design.
+
+    Drives the clock, feeds inputs via the serial interface, waits for
+    the done signal, and checks outputs against golden vectors.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    bits = graph.quant_config.bits
+    seq_name = f"{graph.name}_seq"
+
+    # Compute input/output sizes
+    n_in = 0
+    for inp_name in graph.input_names:
+        shape = graph.input_shapes.get(inp_name, (1,))
+        numel = 1
+        for s in shape:
+            numel *= s
+        n_in += numel
+
+    lines = []
+    lines.append("`timescale 1ns / 1ps")
+    lines.append("")
+    lines.append(f"module {seq_name}_tb;")
+    lines.append("")
+    lines.append(f"    reg clk;")
+    lines.append(f"    reg rst_n;")
+    lines.append(f"    reg signed [{bits - 1}:0] data_in;")
+    lines.append(f"    reg data_valid;")
+    lines.append(f"    wire signed [{bits - 1}:0] data_out;")
+    lines.append(f"    wire out_valid;")
+    lines.append(f"    wire done;")
+    lines.append(f"    wire ready;")
+    lines.append("")
+
+    # DUT
+    lines.append(f"    {seq_name} dut (")
+    lines.append(f"        .clk(clk),")
+    lines.append(f"        .rst_n(rst_n),")
+    lines.append(f"        .data_in(data_in),")
+    lines.append(f"        .data_valid(data_valid),")
+    lines.append(f"        .data_out(data_out),")
+    lines.append(f"        .out_valid(out_valid),")
+    lines.append(f"        .done(done),")
+    lines.append(f"        .ready(ready)")
+    lines.append(f"    );")
+    lines.append("")
+
+    # Clock generation
+    lines.append(f"    initial clk = 0;")
+    lines.append(f"    always #5 clk = ~clk;  // 100MHz")
+    lines.append("")
+    lines.append(f"    integer errors;")
+    lines.append(f"    integer out_idx;")
+    lines.append(f"    integer total_checks;")
+    lines.append("")
+
+    # Flatten test inputs into a single array for serial feeding
+    lines.append(f"    initial begin")
+
+    if vcd:
+        lines.append(f'        $dumpfile("{seq_name}_tb.vcd");')
+        lines.append(f"        $dumpvars(0, {seq_name}_tb);")
+        lines.append("")
+
+    lines.append(f"        errors = 0;")
+    lines.append(f"        total_checks = 0;")
+    lines.append(f"        data_in = 0;")
+    lines.append(f"        data_valid = 0;")
+    lines.append(f"")
+    lines.append(f"        // Reset")
+    lines.append(f"        rst_n = 0;")
+    lines.append(f"        #20;")
+    lines.append(f"        rst_n = 1;")
+    lines.append(f"        #10;")
+    lines.append(f"")
+
+    # Determine number of test vectors
+    n_tests = 0
+    for inp_name in graph.input_names:
+        if inp_name in test_inputs:
+            data = test_inputs[inp_name]
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            n_tests = max(n_tests, data.shape[0])
+
+    # Compute the number of output elements for verification
+    n_out = 0
+    out_expected_flat = {}
+    for out_name in graph.output_names:
+        if out_name in expected_outputs:
+            data = expected_outputs[out_name]
+            numel = data.shape[-1] if data.ndim > 1 else data.size
+            out_expected_flat[out_name] = numel
+            n_out += numel
+
+    for t in range(n_tests):
+        lines.append(f"        // === Test vector {t} ===")
+
+        # Wait for ready before feeding (after the first vector)
+        if t > 0:
+            lines.append(f"        while (!ready) @(posedge clk);")
+
+        lines.append(f"        @(posedge clk);")
+
+        # Feed inputs serially
+        all_vals = []
+        for inp_name in graph.input_names:
+            if inp_name in test_inputs:
+                data = test_inputs[inp_name]
+                if data.ndim == 1:
+                    data = data.reshape(1, -1)
+                vec = data[t].flatten()
+                all_vals.extend(int(v) for v in vec)
+
+        for i, v in enumerate(all_vals):
+            lines.append(f"        data_in = {emit.slit(bits, v)};")
+            lines.append(f"        data_valid = 1;")
+            lines.append(f"        @(posedge clk);")
+        lines.append(f"        data_valid = 0;")
+        lines.append(f"")
+
+        # Wait for done
+        lines.append(f"        // Wait for computation to complete")
+        lines.append(f"        while (!done) @(posedge clk);")
+        lines.append(f"        @(posedge clk);  // one cycle after done for capture to settle")
+        lines.append(f"")
+
+        # Verify captured outputs against expected values
+        # Use global index: t * n_out + i (cap_idx is never reset between vectors)
+        lines.append(f"        // Verify outputs for vector {t}")
+        flat_idx = 0
+        for out_name in graph.output_names:
+            if out_name in expected_outputs:
+                exp_data = expected_outputs[out_name]
+                if exp_data.ndim == 1:
+                    exp_data = exp_data.reshape(1, -1)
+                numel = out_expected_flat[out_name]
+                if t < exp_data.shape[0]:
+                    vec = exp_data[t].flatten()
+                    for i in range(numel):
+                        exp_val = int(vec[i])
+                        global_idx = t * n_out + flat_idx
+                        lines.append(f"        total_checks = total_checks + 1;")
+                        if tolerance > 0:
+                            # Use named wires in a begin/end block to avoid
+                            # illegal bit-selects on literal constants in Verilog-2001
+                            exp_wire = f"exp_seq_{t}_{flat_idx}"
+                            diff_wire = f"diff_seq_{t}_{flat_idx}"
+                            lines.append(f"        // Tolerance check for captured_outputs[{global_idx}]")
+                            lines.append(f"        begin")
+                            lines.append(f"            wire signed [{bits-1}:0] {exp_wire} = {emit.slit(bits, exp_val)};")
+                            lines.append(f"            wire signed [{bits}:0] {diff_wire} = "
+                                         f"{{{{1{{captured_outputs[{global_idx}][{bits-1}]}}}}, captured_outputs[{global_idx}]}} - "
+                                         f"{{{{1{{{exp_wire}[{bits-1}]}}}}, {exp_wire}}};")
+                            lines.append(f"            if ({diff_wire} > {tolerance} || {diff_wire} < -{tolerance}) begin")
+                            lines.append(
+                                f'                $display("FAIL vec {t} out[{flat_idx}]: '
+                                f'got %0d expected {exp_val}", captured_outputs[{global_idx}]);')
+                            lines.append(f"                errors = errors + 1;")
+                            lines.append(f"            end")
+                            lines.append(f"        end")
+                        else:
+                            lines.append(
+                                f"        if (captured_outputs[{global_idx}] !== {emit.slit(bits, exp_val)}) begin")
+                            lines.append(
+                                f'            $display("FAIL vec {t} out[{flat_idx}]: '
+                                f'got %0d expected {exp_val}", captured_outputs[{global_idx}]);')
+                            lines.append(f"            errors = errors + 1;")
+                            lines.append(f"        end")
+                        flat_idx += 1
+        lines.append(f"")
+
+    lines.append(f'        $display("Results: %0d/%0d checks passed", '
+                 f'total_checks - errors, total_checks);')
+    lines.append(f'        if (errors == 0) $display("PASS — all {n_tests} sequential test vectors verified");')
+    lines.append(f'        else $display("FAILED — %0d errors", errors);')
+    lines.append(f"        $finish;")
+    lines.append(f"    end")
+    lines.append("")
+
+    # Output capture process: runs in parallel, captures outputs as they stream
+    lines.append(f"    // Output capture and verification (concurrent process)")
+    lines.append(f"    reg signed [{bits - 1}:0] captured_outputs [0:{n_tests * n_out - 1}];")
+    lines.append(f"    integer cap_idx;")
+    lines.append(f"    initial begin")
+    lines.append(f"        cap_idx = 0;")
+    lines.append(f"        forever begin")
+    lines.append(f"            @(posedge clk);")
+    lines.append(f"            if (out_valid) begin")
+    lines.append(f"                captured_outputs[cap_idx] = data_out;")
+    lines.append(f"                cap_idx = cap_idx + 1;")
+    lines.append(f"            end")
+    lines.append(f"        end")
+    lines.append(f"    end")
+    lines.append("")
+    lines.append(f"endmodule")
+
+    tb_path = out / f"{seq_name}_tb.v"
     tb_path.write_text("\n".join(lines), encoding="utf-8")
     return str(tb_path)
 
@@ -374,7 +634,7 @@ def _forward_op_int(
             tensors[op.outputs[0]] = np.clip(scaled, -qmax, qmax).astype(np.int64)
 
     elif op.op_type == OpType.RELU:
-        tensors[op.outputs[0]] = np.maximum(0, _get(op.inputs[0]))
+        tensors[op.outputs[0]] = np.clip(_get(op.inputs[0]), 0, qmax)
 
     elif op.op_type == OpType.SIGMOID:
         x = _get(op.inputs[0])
@@ -424,7 +684,7 @@ def _forward_op_int(
 
     elif op.op_type == OpType.FLATTEN:
         x = _get(op.inputs[0])
-        tensors[op.outputs[0]] = x.reshape(x.shape[0], -1) if x.ndim > 2 else x.flatten()
+        tensors[op.outputs[0]] = x.flatten()
 
     elif op.op_type == OpType.RESHAPE:
         x = _get(op.inputs[0])
@@ -506,6 +766,108 @@ def _forward_op_int(
             tensors[op.outputs[0]] = x.mean(axis=(1, 2)).astype(np.int64)
         else:
             tensors[op.outputs[0]] = x
+
+    elif op.op_type == OpType.CONV1D:
+        # Simplified int conv1d
+        x = _get(op.inputs[0])
+        w = op.q_weights['weight'].astype(np.int64)
+        b = op.q_weights.get('bias', np.zeros(w.shape[0])).astype(np.int64)
+        stride = op.attrs.get('stride', (1,))
+        if isinstance(stride, int):
+            stride = (stride,)
+        padding = op.attrs.get('padding', (0,))
+        if isinstance(padding, int):
+            padding = (padding,)
+        c_out, c_in, kw = w.shape
+
+        if x.ndim == 2:
+            _, w_in = x.shape
+            x = x.reshape(c_in, w_in)
+        else:
+            w_in = x.shape[-1]
+
+        pw = padding[0]
+        w_out = (w_in + 2 * pw - kw) // stride[0] + 1
+
+        if pw > 0:
+            x_pad = np.zeros((c_in, w_in + 2 * pw), dtype=np.int64)
+            x_pad[:, pw:pw + w_in] = x
+        else:
+            x_pad = x
+
+        out = np.zeros((c_out, w_out), dtype=np.int64)
+        for co in range(c_out):
+            for ow in range(w_out):
+                iw = ow * stride[0]
+                patch = x_pad[:, iw:iw + kw]
+                out[co, ow] = np.sum(w[co] * patch) + b[co]
+
+        mult = op.q_params.get('requant_mult', np.ones(c_out, dtype=np.int64))
+        shift = op.q_params.get('requant_shift', 0)
+        if isinstance(mult, np.ndarray):
+            for co in range(c_out):
+                out[co] = (out[co] * int(mult[co])) >> shift
+        else:
+            out = (out * int(mult)) >> shift
+
+        act = op.attrs.get('activation', 'none')
+        if act == 'relu':
+            out = np.clip(out, 0, qmax)
+        else:
+            out = np.clip(out, -qmax, qmax)
+        tensors[op.outputs[0]] = out.astype(np.int64)
+
+    elif op.op_type == OpType.AVGPOOL2D:
+        x = _get(op.inputs[0])
+        ks = op.attrs.get('kernel_size', (2, 2))
+        st = op.attrs.get('stride', ks)
+        c, h, w_dim = x.shape
+        h_out = (h - ks[0]) // st[0] + 1
+        w_out = (w_dim - ks[1]) // st[1] + 1
+        out = np.zeros((c, h_out, w_out), dtype=np.int64)
+        for ch in range(c):
+            for oh in range(h_out):
+                for ow in range(w_out):
+                    patch = x[ch, oh*st[0]:oh*st[0]+ks[0], ow*st[1]:ow*st[1]+ks[1]]
+                    out[ch, oh, ow] = np.round(np.mean(patch)).astype(np.int64)
+        tensors[op.outputs[0]] = out
+
+    elif op.op_type == OpType.LAYERNORM:
+        x = _get(op.inputs[0]).astype(np.float64)
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        x_norm = (x - mean) / np.sqrt(var + 1e-5)
+        scale = op.q_weights.get('scale', np.ones(x.shape[-1])).astype(np.float64)
+        bias = op.q_weights.get('bias', np.zeros(x.shape[-1])).astype(np.float64)
+        out = x_norm * scale + bias
+        tensors[op.outputs[0]] = np.clip(np.round(out), -qmax, qmax).astype(np.int64)
+
+    elif op.op_type == OpType.RMSNORM:
+        x = _get(op.inputs[0]).astype(np.float64)
+        rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + 1e-5)
+        x_norm = x / rms
+        scale = op.q_weights.get('scale', np.ones(x.shape[-1])).astype(np.float64)
+        out = x_norm * scale
+        tensors[op.outputs[0]] = np.clip(np.round(out), -qmax, qmax).astype(np.int64)
+
+    elif op.op_type == OpType.BATCHNORM:
+        x = _get(op.inputs[0]).astype(np.float64)
+        scale = op.q_weights.get('scale', np.ones(x.shape[0] if x.ndim >= 2 else 1)).astype(np.float64)
+        bias = op.q_weights.get('bias', np.zeros(x.shape[0] if x.ndim >= 2 else 1)).astype(np.float64)
+        # Apply folded batchnorm: out = x * scale + bias
+        if x.ndim == 3:
+            out = x * scale[:, None, None] + bias[:, None, None]
+        elif x.ndim == 2:
+            out = x * scale[None, :] + bias[None, :]
+        else:
+            out = x * scale + bias
+        tensors[op.outputs[0]] = np.clip(np.round(out), -qmax, qmax).astype(np.int64)
+
+    elif op.op_type == OpType.SOFTMAX:
+        x = _get(op.inputs[0]).astype(np.float64) / qmax
+        e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        sm = e_x / np.sum(e_x, axis=-1, keepdims=True)
+        tensors[op.outputs[0]] = np.clip(np.round(sm * qmax), 0, qmax).astype(np.int64)
 
     elif op.op_type == OpType.EMBEDDING:
         idx = _get(op.inputs[0])
