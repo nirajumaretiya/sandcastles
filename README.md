@@ -42,7 +42,7 @@ Architecturally supports the building blocks used in modern LLMs (DeepSeek, Llam
 
 **Quantization**: int4, int8, int16. Symmetric or asymmetric. Per-tensor or per-channel. Mixed-precision per layer.
 
-**Import**: HuggingFace models (GPT-2, Llama, Mistral, Qwen2, Phi, Gemma), ONNX models, numpy arrays, or the fluent GraphBuilder API.
+**Import**: HuggingFace models (GPT-2, Llama, Mistral, Qwen, Gemma), ONNX models, numpy arrays, or the fluent GraphBuilder API.
 
 **Output**: Combinational core, sequential ROM+MAC, serial I/O wrapper, Tiny Tapeout interface.
 
@@ -96,7 +96,7 @@ python -m w2s compile hf://openai-community/gpt2 --mode sequential --bits 8
 python -m w2s info hf://TinyLlama/TinyLlama-1.1B-Chat-v1.0
 ```
 
-Supported architectures: GPT-2, Llama, Mistral, Qwen2, Phi, Gemma.
+Supported architectures: GPT, Llama, Mistral, Qwen, Phi, Gemma.
 
 ### Auto-fit
 
@@ -281,8 +281,7 @@ Every weight is a literal constant. No RAM, no ROM, no bus. The model IS the cir
 - GPT-2 block 0: **5.9M pre-trained weights** compiled in ~5 seconds
 - Area estimator: **~99% accuracy** vs actual Yosys gate count on tested designs
 - Sequential mode: significantly fewer gates than combinational for same network
-- **168 automated tests** covering quantization, compilation, estimation, sparsity, FPGA targeting, mixed precision, testbench generation, HuggingFace import, auto-fit, and build pipeline
-- Tested end-to-end: HuggingFace download → quantize → forward_int (with MHA) → sequential Verilog for real GPT-2
+- Tested end-to-end: HuggingFace download → quantize → forward_int (with MHA) → sequential Verilog for GPT-2
 
 ## Architecture
 
